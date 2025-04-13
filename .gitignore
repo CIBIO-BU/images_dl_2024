@@ -1,0 +1,10 @@
+# Ignore all image files
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.tiff
+
+# Ignore the dataset folder if images are stored there
+KGA_S1/
