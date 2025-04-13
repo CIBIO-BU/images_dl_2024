@@ -5,6 +5,9 @@
 *.bmp
 *.gif
 *.tiff
+*.csv
+*.json
+*.xml
 
 # Ignore the dataset folder if images are stored there
 KGA_S1/
