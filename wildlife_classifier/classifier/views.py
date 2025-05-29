@@ -1,81 +1,140 @@
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
+from django.conf import settings
 import torch
 import torchvision
-from torchvision import transforms
+from torchvision import transforms, models
 from PIL import Image
 import tempfile
 import os
-from django.conf import settings
-import base64
-from io import BytesIO
+import json
+from .models import Feedback
+from ultralytics import YOLO
 
-# Load the Faster R-CNN model (pre-trained on COCO)
-model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
-model.eval()  # Set the model to evaluation mode
+# Load models
+yolo_model = YOLO(os.path.join(settings.BASE_DIR, 'classifier', 'models', 'crop.pt'))
+yolo_model.model.eval()
 
-# COCO class labels (81 classes, including background)
-COCO_LABELS = [
-    "background", "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
-    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse",
-    "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie",
-    "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
-    "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon",
-    "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut",
-    "cake", "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
-    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book",
-    "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
+resnet = models.resnet50(weights=None)
+resnet.fc = torch.nn.Sequential(
+    torch.nn.Linear(resnet.fc.in_features, 1024),
+    torch.nn.BatchNorm1d(1024),
+    torch.nn.ReLU(),
+    torch.nn.Dropout(0.5),
+    torch.nn.Linear(1024, 15)
+)
+checkpoint_path = os.path.join(settings.BASE_DIR, 'classifier', 'models', '15_s.pth')
+checkpoint = torch.load(checkpoint_path, map_location='cpu')
+resnet.load_state_dict(checkpoint['model_state_dict'])
+resnet.eval()
+
+CLASS_NAMES = [
+    'aepyceros melampus', 'bos taurus', 'cephalophus nigrifrons', 'crax rubra', 'dasyprocta punctata',
+    'didelphis pernigra', 'equus quagga', 'leopardus pardalis', 'loxodonta africana', 'madoqua guentheri',
+    'meleagris ocellata', 'mitu tuberosum', 'panthera onca', 'pecari tajacu', 'tayassu pecari'
 ]
 
-# Ensure the "cropped" folder exists
-CROPPED_IMAGES_DIR = os.path.join(settings.BASE_DIR, "cropped")
-os.makedirs(CROPPED_IMAGES_DIR, exist_ok=True)
+classification_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
 
 @csrf_exempt
 def predict(request):
     if request.method == "POST" and request.FILES.get("file"):
         image = request.FILES["file"]
 
-        # Save the uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
             for chunk in image.chunks():
                 temp_file.write(chunk)
             temp_file_path = temp_file.name
 
-        # Load and preprocess the image
-        image_data = Image.open(temp_file_path).convert("RGB")
-        transform = transforms.Compose([transforms.ToTensor()])
-        image_tensor = transform(image_data)
+        original_image = Image.open(temp_file_path).convert("RGB")
+        results = yolo_model.predict(source=temp_file_path, save=False, imgsz=640, conf=0.5)
+        detections = results[0].boxes.xyxy
+        confidences = results[0].boxes.conf
+        class_ids = results[0].boxes.cls
 
-        # Run detection on the image
-        with torch.no_grad():
-            predictions = model([image_tensor])
+        detection_results = []
 
-        # Filter detections above a confidence threshold (e.g., 0.5) and only for animals
-        detections_above_threshold = []
-        for box, label, score in zip(predictions[0]["boxes"], predictions[0]["labels"], predictions[0]["scores"]):
-            if score > 0.5 and COCO_LABELS[label.item()] in ["bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "person"]:
-                # Convert bounding box coordinates to integers
-                x_min, y_min, x_max, y_max = map(int, box.tolist())
+        for idx, (box, detection_conf, yolo_class_id) in enumerate(zip(detections, confidences, class_ids)):
+            if detection_conf < 0.5:
+                continue
 
-                # Crop the image using the bounding box
-                cropped_image = image_data.crop((x_min, y_min, x_max, y_max))
+            x1, y1, x2, y2 = map(int, box.tolist())
+            cropped_img = original_image.crop((x1, y1, x2, y2))
+            input_tensor = classification_transform(cropped_img).unsqueeze(0)
 
-                print(f"Detected {COCO_LABELS[label.item()]} with confidence {score:.2f}")
-                # Save the cropped image to the "cropped" folder
-                cropped_image_filename = f"cropped_{len(detections_above_threshold)}_{os.path.basename(temp_file_path)}"
-                cropped_image_path = os.path.join(CROPPED_IMAGES_DIR, cropped_image_filename)
-                cropped_image.save(cropped_image_path, format="JPEG")
+            with torch.no_grad():
+                output = resnet(input_tensor)
+                predicted_idx = torch.argmax(output, dim=1).item()
+                predicted_prob = torch.softmax(output, dim=1)[0, predicted_idx].item()
 
-                detections_above_threshold.append({
-                    "bbox": [x_min, y_min, x_max, y_max],  # Bounding box coordinates
-                    "confidence": float(score),  # Confidence score
-                    "label": COCO_LABELS[label.item()],  # Class label
-                    "cropped_image_path": cropped_image_path  # Path to the cropped image
-                })
+            detection_info = {
+                "bbox": [x1, y1, x2, y2],
+                "detection_confidence": round(float(detection_conf), 4),
+                "species_prediction": CLASS_NAMES[predicted_idx],
+                "species_confidence": round(float(predicted_prob), 4),
+                "index": idx  # Added for feedback reference
+            }
+            detection_results.append(detection_info)
 
-        # Clean up the temporary uploaded file
         os.unlink(temp_file_path)
 
-        return JsonResponse({"detections": detections_above_threshold})
-    return JsonResponse({"error": "Invalid request"}, status=400)
+        return JsonResponse({
+            "detections": detection_results,
+            "num_detections": len(detection_results)
+        })
+
+    return JsonResponse({"error": "Invalid request. POST an image file."}, status=400)
+
+@csrf_exempt
+def feedback(request):
+    if request.method == "POST":
+        try:
+            data = json.loads(request.body)
+            
+            # Save feedback to database
+            feedback = Feedback.objects.create(
+                image_url=data.get('image_url'),
+                original_detections=json.dumps(data.get('detections')),
+                user_feedback=json.dumps(data.get('user_feedback'))
+            )
+            
+            return JsonResponse({
+                "status": "success", 
+                "feedback_id": feedback.id,
+                "message": "Feedback saved successfully"
+            })
+        except Exception as e:
+            return JsonResponse({
+                "status": "error",
+                "message": str(e)
+            }, status=400)
+    return JsonResponse({
+        "error": "Invalid request method"
+    }, status=405)
+
+@csrf_exempt
+def get_feedback_samples(request):
+    if request.method == "GET":
+        try:
+            samples = Feedback.objects.all().values(
+                'id', 'image_url', 'created_at'
+            )[:10]  # Get first 10 samples
+            return JsonResponse({
+                "status": "success",
+                "samples": list(samples)
+            })
+        except Exception as e:
+            return JsonResponse({
+                "status": "error",
+                "message": str(e)
+            }, status=400)
+    return JsonResponse({
+        "error": "Invalid request method"
+    }, status=405)

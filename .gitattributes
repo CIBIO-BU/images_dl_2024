@@ -1,1 +1,4 @@
 *.json filter=lfs diff=lfs merge=lfs -text
+wildlife_classifier/classifier/models/*.pth filter=lfs diff=lfs merge=lfs -text
+wildlife_classifier/classifier/models/*.pt filter=lfs diff=lfs merge=lfs -text
+wildlife_classifier/classifier/models/15_s.pth filter=lfs diff=lfs merge=lfs -text
