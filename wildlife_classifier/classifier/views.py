@@ -6,16 +6,20 @@ from django.conf import settings
 import torch
 import torchvision
 from torchvision import transforms, models
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import tempfile
+import numpy as np
 import os
 import json
 from .models import Feedback
 from ultralytics import YOLO
+from PytorchWildlife.models import detection as pw_detection
 
 # Load models
 yolo_model = YOLO(os.path.join(settings.BASE_DIR, 'classifier', 'models', 'crop.pt'))
 yolo_model.model.eval()
+
+md_model = pw_detection.MegaDetectorV6(version="MDV6-yolov9-c")
 
 resnet = models.resnet50(weights=None)
 resnet.fc = torch.nn.Sequential(
@@ -54,18 +58,19 @@ def predict(request):
             temp_file_path = temp_file.name
 
         original_image = Image.open(temp_file_path).convert("RGB")
+        image_array = np.array((Image.open(temp_file_path)).convert("RGB"))
         results = yolo_model.predict(source=temp_file_path, save=False, imgsz=640, conf=0.5)
+
+        md_results = md_model.single_image_detection(image_array)
         detections = results[0].boxes.xyxy
         confidences = results[0].boxes.conf
         class_ids = results[0].boxes.cls
 
         detection_results = []
 
-        for idx, (box, detection_conf, yolo_class_id) in enumerate(zip(detections, confidences, class_ids)):
-            if detection_conf < 0.5:
-                continue
-
-            x1, y1, x2, y2 = map(int, box.tolist())
+        for bbox, label in zip(md_results['detections'], md_results['labels']):
+            x1, y1, x2, y2 = map(float,bbox[0])
+            print(f"MD Detection: {label} at [{x1}, {y1}, {x2}, {y2}]")
             cropped_img = original_image.crop((x1, y1, x2, y2))
             input_tensor = classification_transform(cropped_img).unsqueeze(0)
 
@@ -76,10 +81,8 @@ def predict(request):
 
             detection_info = {
                 "bbox": [x1, y1, x2, y2],
-                "detection_confidence": round(float(detection_conf), 4),
                 "species_prediction": CLASS_NAMES[predicted_idx],
                 "species_confidence": round(float(predicted_prob), 4),
-                "index": idx  # Added for feedback reference
             }
             detection_results.append(detection_info)
 
