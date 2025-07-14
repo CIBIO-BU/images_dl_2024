@@ -9,8 +9,8 @@ print("Initializing MegaDetectorV6...")
 detection_model = pw_detection.MegaDetectorV6(version="MDV6-yolov9-c")
 print("Model initialized.")
 
-INPUT_FOLDER = "lila_species_organized"
-OUTPUT_FOLDER = "lila_species_cropped"
+INPUT_FOLDER = "snapshot_safari_10k"
+OUTPUT_FOLDER = "snapshot_safari_10k_crops"
 
 def crop_and_save(image, bbox_tuple, label, output_dir, base_filename, index):
     try:
