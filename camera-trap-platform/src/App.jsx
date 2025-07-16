@@ -4,14 +4,7 @@ import axios from "axios";
 
 // Main App Component with Router
 function App() {
-  return (
-    <Router>
-      <Routes>
-        <Route path="/login" element={<AuthPage />} />
-        <Route path="/" element={<ProtectedRoute><MainApp /></ProtectedRoute>} />
-      </Routes>
-    </Router>
-  );
+  return <MainApp />;
 }
 
 // Protected Route Component
@@ -206,30 +199,63 @@ function MainApp() {
   };
 
   const handleFeedbackSubmit = async () => {
-    if (!selectedImage || Object.keys(currentFeedback).length === 0) {
-      showNotification("No feedback to submit", "warning");
-      return;
-    }
+  if (!selectedImage || Object.keys(currentFeedback).length === 0) {
+    showNotification("No feedback to submit", "warning");
+    return;
+  }
 
-    try {
-      await axios.post("http://127.0.0.1:8000/api/feedback/", {
-        image_url: selectedImage,
-        detections: detections[selectedImage],
-        user_feedback: currentFeedback,
-      }, {
+  try {
+    // Prepare the feedback payload
+    const payload = {
+      image_url: selectedImage,
+      detections: detections[selectedImage].map(det => ({
+        bbox: det.bbox,
+        label: det.label,
+        confidence: det.confidence,
+        index: det.index
+      })),
+      user_feedback: currentFeedback
+    };
+
+    const response = await axios.post(
+      "http://127.0.0.1:8000/api/feedback/",
+      payload,
+      {
         headers: {
-          "Authorization": `Bearer ${localStorage.getItem("token")}`
+          "Content-Type": "application/json",
         }
-      });
+      }
+    );
 
+    if (response.data.status === "success") {
       showNotification("Feedback submitted successfully!", "success");
       setFeedbackOpen(false);
       setCurrentFeedback({});
-    } catch (error) {
-      console.error("Error submitting feedback:", error);
-      showNotification("Failed to submit feedback", "error");
+      
+      // Update local state with the feedback
+      setDetections(prev => {
+        const updated = {...prev};
+        if (updated[selectedImage]) {
+          updated[selectedImage] = updated[selectedImage].map(det => ({
+            ...det,
+            ...currentFeedback[det.index]
+          }));
+        }
+        return updated;
+      });
+    } else {
+      throw new Error(response.data.error || "Failed to save feedback");
     }
-  };
+  } catch (error) {
+    console.error("Feedback submission error:", error);
+    showNotification(
+      error.response?.data?.error || 
+      error.message || 
+      "Failed to submit feedback",
+      "error"
+    );
+  }
+};
 
   const showNotification = (message, type) => {
     setNotification({ message, type });
