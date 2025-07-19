@@ -14,11 +14,14 @@ import json
 from .models import Feedback
 import logging
 from PytorchWildlife.models import detection as pw_detection
+from PytorchWildlife.models import classification as pw_classification
 
 logger = logging.getLogger(__name__)
 
 # Load models
-md_model = pw_detection.MegaDetectorV6(version="MDV6-yolov9-c")
+md_model = pw_detection.MegaDetectorV6(version="MDV6-yolov10-e")
+
+md_classifier = pw_classification.AI4GSerengeti()
 
 resnet = models.resnet50(weights=None)
 resnet.fc = torch.nn.Sequential(
@@ -58,12 +61,8 @@ def predict(request):
 
         original_image = Image.open(temp_file_path).convert("RGB")
         image_array = np.array((Image.open(temp_file_path)).convert("RGB"))
-        results = yolo_model.predict(source=temp_file_path, save=False, imgsz=640, conf=0.5)
 
         md_results = md_model.single_image_detection(image_array)
-        detections = results[0].boxes.xyxy
-        confidences = results[0].boxes.conf
-        class_ids = results[0].boxes.cls
 
         detection_results = []
 

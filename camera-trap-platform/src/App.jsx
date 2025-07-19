@@ -141,11 +141,6 @@ function MainApp() {
   const [currentFeedback, setCurrentFeedback] = useState({});
   const [notification, setNotification] = useState(null);
 
-  const handleLogout = () => {
-    localStorage.removeItem("token");
-    window.location.href = "/login";
-  };
-
   const handleImageUpload = async (files) => {
     setIsLoading(true);
     setNotification(null);
@@ -290,9 +285,6 @@ function MainApp() {
 
       <div style={styles.header}>
         <h1 style={styles.title}>Wildlife Image Classifier</h1>
-        <button onClick={handleLogout} style={styles.logoutButton}>
-          Logout
-        </button>
       </div>
 
       <div style={styles.buttonRow}>
