@@ -24,14 +24,14 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True  # Handle corrupted images
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Progressive ResNet50 Wildlife Classification')
-    parser.add_argument('--data-dir', type=str, default='lila_species_cropped', help='Path to dataset directory')
+    parser.add_argument('--data-dir', type=str, default='snapshot_safari_10k_crops', help='Path to dataset directory')
     parser.add_argument('--epochs-per-subset', type=int, default=5, help='Epochs per subset')
     parser.add_argument('--batch-size', type=int, default=64, help='Batch size for training')
     parser.add_argument('--lr', type=float, default=0.001, help='Initial learning rate')
     parser.add_argument('--min-samples', type=int, default=4000, help='Minimum samples per class')
     parser.add_argument('--num-subsets', type=int, default=20, help='Number of data subsets')
     parser.add_argument('--num-workers', type=int, default=0, help='Number of data loader workers')
-    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints', help='Directory to save checkpoints')
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints_384', help='Directory to save checkpoints')
     parser.add_argument('--subset-range', type=str, default='0-19', help='Subset range to process (e.g., "5-19")')
     parser.add_argument('--early-stopping', type=int, default=3, help='Patience for early stopping')
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay for optimizer')
@@ -324,7 +324,7 @@ def train_on_subsets(args, model, full_dataset, device):
 
         # Training transforms with augmentation
         train_transform = transforms.Compose([
-            transforms.RandomResizedCrop(224),
+            transforms.RandomResizedCrop(384),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
             transforms.RandomRotation(15),
@@ -352,8 +352,8 @@ def train_on_subsets(args, model, full_dataset, device):
         
         # Validation transforms
         val_transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
+            transforms.Resize(448),
+            transforms.CenterCrop(384),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
@@ -583,21 +583,43 @@ def main():
     print("📦 Loading data...")
     full_dataset = datasets.ImageFolder(args.data_dir)
     class_dist = get_class_distribution(full_dataset)
-    print("📊 Class distribution:", json.dumps(class_dist, indent=2))
+    print("📊 Initial class distribution:", json.dumps(class_dist, indent=2))
     
-    # Verify minimum samples
+    # Filter classes with insufficient samples
+    valid_classes = []
+    excluded_classes = []
     for cls, count in class_dist.items():
-        if count < args.min_samples:
-            raise ValueError(f"Class {cls} has only {count} samples (minimum {args.min_samples} required)")
+        if count >= args.min_samples:
+            valid_classes.append(cls)
+        else:
+            excluded_classes.append(cls)
     
-    # Initialize model
+    # Filter the dataset to only include valid classes
+    valid_class_indices = [full_dataset.class_to_idx[cls] for cls in valid_classes]
+    valid_samples = [
+        (path, valid_class_indices.index(label)) 
+        for path, label in full_dataset.samples 
+        if label in [full_dataset.class_to_idx[cls] for cls in valid_classes]
+    ]
+    
+    # Create new dataset with only valid classes
+    filtered_dataset = datasets.ImageFolder(args.data_dir)
+    filtered_dataset.samples = valid_samples
+    filtered_dataset.targets = [s[1] for s in valid_samples]
+    filtered_dataset.classes = valid_classes
+    filtered_dataset.class_to_idx = {cls: i for i, cls in enumerate(valid_classes)}
+    
+    print(f"🚫 Excluded {len(excluded_classes)} classes with < {args.min_samples} samples:")
+    print(excluded_classes)
+    print("📊 Filtered class distribution:", json.dumps(get_class_distribution(filtered_dataset), indent=2))
+    
+    # Initialize model with filtered classes
     print("🧠 Initializing model...")
     initial_subset_group = (int(args.subset_range.split('-')[0]) // 5) + 1
-    model = setup_model(len(full_dataset.classes), device, initial_subset_group)
+    model = setup_model(len(filtered_dataset.classes), device, initial_subset_group)
     
-    # Training
-    print(f"🔥 Starting training on subsets {args.subset_range}...")
-    history = train_on_subsets(args, model, full_dataset, device)
+    # Use filtered_dataset instead of full_dataset for training
+    history = train_on_subsets(args, model, filtered_dataset, device)
     
     # Save results
     print("\n🏆 Training complete! Saving results...")

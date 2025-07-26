@@ -15,13 +15,14 @@ from .models import Feedback
 import logging
 from PytorchWildlife.models import detection as pw_detection
 from PytorchWildlife.models import classification as pw_classification
+from django.core.exceptions import ValidationError
 
 logger = logging.getLogger(__name__)
 
 # Load models
 md_model = pw_detection.MegaDetectorV6(version="MDV6-yolov10-e")
 
-md_classifier = pw_classification.AI4GSerengeti()
+# md_classifier = pw_classification.AI4GSerengeti()
 
 resnet = models.resnet50(weights=None)
 resnet.fc = torch.nn.Sequential(
@@ -113,9 +114,15 @@ def feedback(request):
                 status=400
             )
         
+        # Create a temporary file path for blob URLs
+        image_url = data['image_url']
+        if image_url.startswith('blob:'):
+            # Handle blob URLs by storing them as a special marker
+            image_url = f"blob-url:{image_url}"
+        
         # Create and save feedback
         feedback = Feedback(
-            image_url=data['image_url'],
+            image_url=image_url,
             original_detections=data['detections'],
             user_feedback=data['user_feedback']
         )
@@ -137,7 +144,7 @@ def feedback(request):
         return JsonResponse({"error": str(e)}, status=400)
     except Exception as e:
         logger.exception("Error saving feedback")
-        return JsonResponse({"error": "Internal server error"}, status=500)
+        return JsonResponse({"error": "Internal server error"}, status=500) 
     
 @csrf_exempt
 def get_feedback_samples(request):
