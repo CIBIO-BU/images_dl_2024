@@ -6,7 +6,7 @@ import torch.optim as optim
 from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from sklearn.model_selection import StratifiedKFold, train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, top_k_accuracy_score, average_precision_score, roc_auc_score
 from tqdm import tqdm
 import argparse
 import json
@@ -24,19 +24,18 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True  # Handle corrupted images
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Progressive ResNet50 Wildlife Classification')
-    parser.add_argument('--data-dir', type=str, default='snapshot_safari_10k_crops', help='Path to dataset directory')
-    parser.add_argument('--epochs-per-subset', type=int, default=5, help='Epochs per subset')
+    parser.add_argument('--data-dir', type=str, default='snapshot_safari_10k_crops_deduped', help='Path to dataset directory')
+    parser.add_argument('--epochs-per-subset', type=int, default=15, help='Epochs per subset')
     parser.add_argument('--batch-size', type=int, default=64, help='Batch size for training')
-    parser.add_argument('--lr', type=float, default=0.001, help='Initial learning rate')
-    parser.add_argument('--min-samples', type=int, default=4000, help='Minimum samples per class')
-    parser.add_argument('--num-subsets', type=int, default=20, help='Number of data subsets')
+    parser.add_argument('--lr', type=float, default=0.0001, help='Initial learning rate')
+    parser.add_argument('--min-samples', type=int, default=3000, help='Minimum samples per class')
+    parser.add_argument('--num-subsets', type=int, default=4, help='Number of data subsets (groups)')
     parser.add_argument('--num-workers', type=int, default=0, help='Number of data loader workers')
-    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints_384', help='Directory to save checkpoints')
-    parser.add_argument('--subset-range', type=str, default='0-19', help='Subset range to process (e.g., "5-19")')
-    parser.add_argument('--early-stopping', type=int, default=3, help='Patience for early stopping')
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints_4_subsets', help='Directory to save checkpoints')
+    parser.add_argument('--early-stopping', type=int, default=10, help='Patience for early stopping')
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay for optimizer')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate')
-    parser.add_argument('--mixup-alpha', type=float, default=0.2, help='Alpha for mixup augmentation')
+    parser.add_argument('--test-split', type=float, default=0.1, help='Fraction of data to use as test set')
     return parser.parse_args()
 
 def validate_subsets(subsets, full_dataset):
@@ -48,21 +47,27 @@ def validate_subsets(subsets, full_dataset):
             raise ValueError(f"Subset {i} missing classes! Expected {all_classes}, got {subset_classes}")
     print("✅ All subsets contain all classes")
 
-def create_subsets(dataset, n_splits=20):
+def create_subsets(dataset, n_splits=4):
     """Split data into balanced subsets ensuring all classes are present"""
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     labels = [label for (_, label) in dataset.samples]
     subsets = []
     
+    # First create the initial splits
+    initial_splits = []
     for _, subset_indices in skf.split(np.zeros(len(labels)), labels):
         subset_classes = set([labels[i] for i in subset_indices])
         if len(subset_classes) != len(dataset.classes):
             print(f"⚠️ Subset missing classes! Expected {len(dataset.classes)}, found {len(subset_classes)}")
             continue
-        subsets.append(Subset(dataset, subset_indices))
+        initial_splits.append(subset_indices)
     
-    if len(subsets) < n_splits:
-        print(f"⚠️ Only {len(subsets)} valid subsets created (requested {n_splits})")
+    # Create progressive subsets (each new subset includes previous data)
+    combined_indices = []
+    for i in range(n_splits):
+        combined_indices = list(initial_splits[i]) + combined_indices
+        subsets.append(Subset(dataset, combined_indices))
+    
     return subsets
 
 def get_class_distribution(dataset):
@@ -78,7 +83,7 @@ def get_class_distribution(dataset):
     else:
         raise ValueError("Unsupported dataset type")
 
-def setup_model(num_classes, device, subset_group=None):
+def setup_model(num_classes, device, subset_group=1):
     """Initialize and configure ResNet50 model with proper unfreezing"""
     model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
     
@@ -88,26 +93,29 @@ def setup_model(num_classes, device, subset_group=None):
         nn.BatchNorm1d(1024),
         nn.ReLU(),
         nn.Dropout(0.5),
-        nn.Linear(1024, num_classes)  # Fixed to your 17 classes
+        nn.Linear(1024, num_classes)
     )
     
-    # Initial setup - only classifier trainable
+    # First freeze all parameters
     for param in model.parameters():
         param.requires_grad = False
-    for param in model.fc.parameters():  # This was missing!
-        param.requires_grad = True
     
-    # Progressive unfreezing
-    if subset_group is not None:
-        if subset_group >= 2:
-            for param in model.layer4.parameters():
-                param.requires_grad = True
-        if subset_group >= 3:
-            for param in model.layer3.parameters():
-                param.requires_grad = True
-        if subset_group >= 4:
-            for param in model.parameters():
-                param.requires_grad = True
+    # Then selectively unfreeze based on subset group
+    if subset_group >= 1:
+        for param in model.fc.parameters():
+            param.requires_grad = True
+    
+    if subset_group >= 2:
+        for param in model.layer4.parameters():
+            param.requires_grad = True
+    
+    if subset_group >= 3:
+        for param in model.layer3.parameters():
+            param.requires_grad = True
+    
+    if subset_group >= 4:
+        for param in model.parameters():  # Unfreeze all
+            param.requires_grad = True
     
     model = model.to(device)
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -118,107 +126,194 @@ def load_checkpoint(model, checkpoint_path, device):
     """Simplified checkpoint loading"""
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        # Load only matching parameters
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         print(f"✅ Loaded checkpoint from {checkpoint_path}")
         return True
     except Exception as e:
         print(f"⚠️ Checkpoint loading failed: {str(e)}")
         return False  
-    
-def mixup_data(x, y, alpha=1.0, device='cuda'):
-    """Returns mixed inputs, pairs of targets, and lambda"""
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
 
-    batch_size = x.size()[0]
-    index = torch.randperm(batch_size).to(device)
-
-    mixed_x = lam * x + (1 - lam) * x[index, :]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
-
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
-
-def train_epoch(model, loader, optimizer, criterion, device, mixup_alpha=0.0):
-    """Single training epoch with optional mixup augmentation"""
+def train_epoch(model, loader, optimizer, criterion, device):
+    """Single training epoch"""
     model.train()
     total_loss, correct = 0.0, 0
     
     for inputs, labels in tqdm(loader, desc="Training", leave=False):
         inputs, labels = inputs.to(device), labels.to(device)
         
-        # Apply mixup if enabled
-        if mixup_alpha > 0:
-            inputs, targets_a, targets_b, lam = mixup_data(inputs, labels, mixup_alpha, device)
-        
         optimizer.zero_grad()
         outputs = model(inputs)
-        
-        if mixup_alpha > 0:
-            loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
-        else:
-            loss = criterion(outputs, labels)
-        
+        loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
         
         total_loss += loss.item() * inputs.size(0)
-        
-        # For mixup, we calculate accuracy differently
-        if mixup_alpha > 0:
-            _, preds = torch.max(outputs, 1)
-            correct += (lam * preds.eq(targets_a).sum().item() + 
-                       (1 - lam) * preds.eq(targets_b).sum().item())
-        else:
-            correct += (outputs.argmax(1) == labels).sum().item()
+        correct += (outputs.argmax(1) == labels).sum().item()
     
     return total_loss / len(loader.dataset), correct / len(loader.dataset)
 
-def validate(model, loader, class_names, criterion, device):
-    """Validation pass with per-class metrics"""
+def evaluate(model, loader, class_names, criterion, device):
+    """Comprehensive evaluation with confidence metrics"""
     model.eval()
-    all_preds, all_labels = [], []
+    all_preds, all_labels, all_probs = [], [], []
     val_loss = 0.0
-    
+
     with torch.no_grad():
-        for inputs, labels in tqdm(loader, desc="Validating", leave=False):
+        for inputs, labels in tqdm(loader, desc="Evaluating", leave=False):
             inputs, labels = inputs.to(device), labels.to(device)
             outputs = model(inputs)
+            probs = torch.softmax(outputs, dim=1)
             val_loss += criterion(outputs, labels).item() * inputs.size(0)
-            
-            _, preds = torch.max(outputs, 1)
+
+            _, preds = torch.max(probs, 1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+
+    all_probs = np.array(all_probs)
+    all_labels = np.array(all_labels)
+    all_preds = np.array(all_preds)
     
-    # Generate comprehensive classification report
-    report = classification_report(
-        all_labels, all_preds,
-        target_names=class_names,
-        output_dict=True,
-        zero_division=0
-    )
-    
-    # Generate confusion matrix
-    cm = confusion_matrix(all_labels, all_preds)
-    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-    
+    # Basic metrics
     val_loss /= len(loader.dataset)
-    val_acc = report['accuracy']
-    class_metrics = {
-        cls: {k: v for k, v in report[cls].items() 
-              if k in ['precision', 'recall', 'f1-score']}
-        for cls in class_names
-    }
+    val_acc = np.mean(all_preds == all_labels)
+    top5_acc = top_k_accuracy_score(all_labels, all_probs, k=5)
     
-    return val_loss, val_acc, class_metrics, cm_normalized
+    # Confidence metrics
+    confidences = np.max(all_probs, axis=1)
+    correct_mask = (all_preds == all_labels)
+    
+    # 1. Mean Confidence per Species
+    mean_conf_correct = []
+    mean_conf_incorrect = []
+    for class_idx in range(len(class_names)):
+        class_mask = (all_preds == class_idx)
+        if np.sum(class_mask) > 0:
+            mean_conf_correct.append(np.mean(confidences[class_mask & correct_mask]))
+            mean_conf_incorrect.append(np.mean(confidences[class_mask & ~correct_mask]))
+        else:
+            mean_conf_correct.append(np.nan)
+            mean_conf_incorrect.append(np.nan)
+    
+    # 2. Confidence Histograms
+    conf_bins = np.linspace(0, 1, 11)  # 0-0.1, 0.1-0.2, etc.
+    overall_hist, _ = np.histogram(confidences, bins=conf_bins)
+    correct_hist, _ = np.histogram(confidences[correct_mask], bins=conf_bins)
+    incorrect_hist, _ = np.histogram(confidences[~correct_mask], bins=conf_bins)
+    
+    # 3. Calibration Curve
+    bin_centers = []
+    bin_accuracies = []
+    bin_confidences = []
+    for i in range(len(conf_bins)-1):
+        in_bin = (confidences >= conf_bins[i]) & (confidences < conf_bins[i+1])
+        if np.sum(in_bin) > 0:
+            bin_acc = np.mean(all_preds[in_bin] == all_labels[in_bin])
+            bin_conf = np.mean(confidences[in_bin])
+            bin_centers.append((conf_bins[i] + conf_bins[i+1]) / 2)
+            bin_accuracies.append(bin_acc)
+            bin_confidences.append(bin_conf)
+    
+    # Calculate Expected Calibration Error (ECE)
+    ece = np.sum(np.abs(np.array(bin_accuracies) - np.array(bin_confidences)) * 
+                np.array([np.sum((confidences >= conf_bins[i]) & 
+                               (confidences < conf_bins[i+1])) for i in range(len(conf_bins)-1)]) / len(all_preds))
+    
+    # 4. Top-k Confidence Accuracy
+    topk_accuracies = []
+    for k in range(1, 6):
+        topk_accuracies.append(top_k_accuracy_score(all_labels, all_probs, k=k))
+    
+    # 5. Rejection Curve
+    thresholds = np.linspace(0, 0.95, 20)
+    rejection_metrics = []
+    for thresh in thresholds:
+        keep = confidences >= thresh
+        if np.sum(keep) > 0:
+            acc = np.mean(all_preds[keep] == all_labels[keep])
+            precision = np.sum((all_preds[keep] == all_labels[keep])) / np.sum(keep)
+            recall = np.sum((all_preds[keep] == all_labels[keep])) / len(all_preds)
+            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+            rejection_rate = 1 - (np.sum(keep) / len(all_preds))
+            rejection_metrics.append({
+                'threshold': thresh,
+                'accuracy': acc,
+                'precision': precision,
+                'recall': recall,
+                'f1': f1,
+                'rejection_rate': rejection_rate
+            })
+    
+    # 6. Class-Level Confidence Variance
+    class_conf_vars = []
+    for class_idx in range(len(class_names)):
+        class_mask = (all_preds == class_idx)
+        if np.sum(class_mask) > 0:
+            class_conf_vars.append(np.std(confidences[class_mask]))
+        else:
+            class_conf_vars.append(np.nan)
+    
+    # 7. Confidence Gap
+    sorted_probs = np.sort(all_probs, axis=1)
+    confidence_gaps = sorted_probs[:, -1] - sorted_probs[:, -2]
+    mean_gap_per_class = []
+    for class_idx in range(len(class_names)):
+        class_mask = (all_preds == class_idx)
+        if np.sum(class_mask) > 0:
+            mean_gap_per_class.append(np.mean(confidence_gaps[class_mask]))
+        else:
+            mean_gap_per_class.append(np.nan)
+    
+    # 8. False High-Confidence Rate
+    high_conf_thresh = 0.9
+    high_conf_wrong = np.sum((confidences >= high_conf_thresh) & ~correct_mask)
+    high_conf_wrong_rate = high_conf_wrong / np.sum(~correct_mask) if np.sum(~correct_mask) > 0 else 0
+    
+    return {
+        'loss': val_loss,
+        'accuracy': val_acc,
+        'top5_accuracy': top5_acc,
+        'mAP': average_precision_score(np.eye(len(class_names))[all_labels], all_probs, average='macro'),
+        'AUROC': roc_auc_score(np.eye(len(class_names))[all_labels], all_probs, average='macro', multi_class='ovr'),
+        'classification_report': classification_report(all_labels, all_preds, target_names=class_names, output_dict=True),
+        'confusion_matrix': confusion_matrix(all_labels, all_preds, normalize='true'),
+        'confidence_metrics': {
+            'mean_confidence_per_class': {
+                'correct': mean_conf_correct,
+                'incorrect': mean_conf_incorrect
+            },
+            'confidence_distribution': {
+                'overall': overall_hist.tolist(),
+                'correct': correct_hist.tolist(),
+                'incorrect': incorrect_hist.tolist(),
+                'bins': conf_bins.tolist()
+            },
+            'calibration': {
+                'ece': ece,
+                'bin_centers': bin_centers,
+                'bin_accuracies': bin_accuracies,
+                'bin_confidences': bin_confidences
+            },
+            'topk_accuracies': topk_accuracies,
+            'rejection_curve': rejection_metrics,
+            'class_confidence_variability': class_conf_vars,
+            'confidence_gap': {
+                'overall_mean': np.mean(confidence_gaps),
+                'per_class': mean_gap_per_class
+            },
+            'false_high_confidence_rate': high_conf_wrong_rate
+        },
+        'predictions': {
+            'true_labels': all_labels.tolist(),
+            'pred_labels': all_preds.tolist(),
+            'probabilities': all_probs.tolist(),
+            'confidences': confidences.tolist(),
+            'confidence_gaps': confidence_gaps.tolist()
+        }
+    }
 
 def get_weighted_sampler(dataset):
     """Create weighted sampler for imbalanced classes"""
-    # Handle both Dataset and Subset objects
     if isinstance(dataset, Subset):
         class_counts = get_class_distribution(dataset)
         class_weights = {cls: 1./count for cls, count in class_counts.items()}
@@ -231,115 +326,54 @@ def get_weighted_sampler(dataset):
                          for _, label in dataset.samples]
     
     return WeightedRandomSampler(sample_weights, len(sample_weights))
-    
-def train_on_subsets(args, model, full_dataset, device):
-    """Main training loop with all fixes implemented"""
+
+def train_on_subsets(args, model, full_dataset, device, test_loader=None):
+    """Main training loop with 4 subsets (groups)"""
     subsets = create_subsets(full_dataset, args.num_subsets)
     validate_subsets(subsets, full_dataset)
     
     best_acc = 0.0
     history = []
     class_names = full_dataset.classes
-    start, end = map(int, args.subset_range.split('-'))
-    if start == 0:
-        if os.path.exists(args.checkpoint_dir):
-            for f in os.listdir(args.checkpoint_dir):
-                if f.endswith('.pth'):
-                    os.remove(os.path.join(args.checkpoint_dir, f))
-    subset_indices = range(start, end+1)
     
-    for i in subset_indices:
-        print(f"\n🌀 Processing subset {i+1}/{args.num_subsets}")
-        print(f"📊 Subset class distribution: {get_class_distribution(subsets[i])}")
+    for subset_idx in range(args.num_subsets):
+        subset_group = subset_idx + 1  # Groups are 1-4
+        print(f"\n🌀 Processing subset {subset_idx+1}/{args.num_subsets} (Group {subset_group})")
+        print(f"📊 Subset size: {len(subsets[subset_idx])} samples")
+        print(f"📊 Class distribution: {get_class_distribution(subsets[subset_idx])}")
         
-        # Verify class consistency
-        current_classes = set([full_dataset.samples[idx][1] for idx in subsets[i].indices])
-        assert len(current_classes) == len(class_names), \
-            f"Class count mismatch: {len(current_classes)} vs {len(class_names)}"
-        
-        # Model setup
-        subset_group = (i // 5) + 1
+        # Setup model with correct unfreezing
         model = setup_model(len(class_names), device, subset_group)
         
-        # Load checkpoint if available
-        if i > start:
-            checkpoint_path = os.path.join(args.checkpoint_dir, f'best_model_subset_{i-1}.pth')
+        # Load checkpoint if continuing training
+        if subset_idx > 0:
+            checkpoint_path = os.path.join(args.checkpoint_dir, f'best_model_subset_{subset_idx-1}.pth')
             if os.path.exists(checkpoint_path):
-                try:
-                    checkpoint = torch.load(checkpoint_path, map_location=device)
-                    best_acc = checkpoint.get('val_acc', 0.0)  # Initialize from checkpoint
-                    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-                except Exception as e:
-                    print(f"⚠️ Checkpoint loading failed: {str(e)}")
-                    best_acc = 0.0  # Fallback initialization
-    
-    for i in subset_indices:
-        print(f"\n🌀 Processing subset {i+1}/{args.num_subsets}")
+                load_checkpoint(model, checkpoint_path, device)
         
-        # Calculate subset group (1-4)
-        subset_group = (i // 5) + 1
-        prev_group = ((i-1) // 5) + 1 if i > 0 else 1
-        
-        # Ensure checkpoint directory exists
-        os.makedirs(args.checkpoint_dir, exist_ok=True)
-
-        # Handle group transitions
-        if subset_group != prev_group:
-            print(f"\n🚀 GROUP TRANSITION DETECTED: Moving from group {prev_group} to {subset_group}")
-            model = setup_model(len(class_names), device, subset_group)
-            
-            # Try to load compatible parameters from previous checkpoint
-            prev_checkpoint_path = os.path.join(args.checkpoint_dir, f'best_model_subset_{i-1}.pth')
-            if os.path.exists(prev_checkpoint_path):
-                try:
-                    prev_checkpoint = torch.load(prev_checkpoint_path, map_location=device)
-                    current_state = model.state_dict()
-                    
-                    # Load only matching parameters
-                    matched_params = {
-                        k: v for k, v in prev_checkpoint['model_state_dict'].items()
-                        if k in current_state and v.shape == current_state[k].shape
-                    }
-                    
-                    current_state.update(matched_params)
-                    model.load_state_dict(current_state)
-                    print(f"🔄 Loaded {len(matched_params)}/{len(current_state)} compatible parameters across group transition")
-                except Exception as e:
-                    print(f"⚠️ Group transition load failed: {str(e)}")
-                    print("🔁 Starting fresh for new group")
-            else:
-                print("⚠️ No previous checkpoint found for group transition")
-
         # Create train/val split
         train_idx, val_idx = train_test_split(
-            subsets[i].indices,
+            subsets[subset_idx].indices,
             test_size=0.2,
-            stratify=[full_dataset.samples[idx][1] for idx in subsets[i].indices],
+            stratify=[full_dataset.samples[idx][1] for idx in subsets[subset_idx].indices],
             random_state=42
         )
         
-        # Debug check for overlap
-        overlap = set(train_idx) & set(val_idx)
-        assert len(overlap) == 0, f"Data leakage detected in subset {i}!"
-
         # Training transforms with augmentation
         train_transform = transforms.Compose([
-            transforms.RandomResizedCrop(384),
+            transforms.RandomResizedCrop(384, scale=(0.6, 1.0)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
-            transforms.RandomRotation(15),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-            transforms.RandomAffine(degrees=10, translate=(0.1, 0.1)),
+            transforms.RandomRotation(30),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
+            transforms.RandomAffine(degrees=15, translate=(0.2, 0.2)),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
         
-        # Apply transforms to subset
         full_dataset.transform = train_transform
         train_subset = Subset(full_dataset, train_idx)
-        
-        # Create weighted sampler for imbalanced classes
-        sampler = get_weighted_sampler(Subset(full_dataset, train_idx))
+        sampler = get_weighted_sampler(train_subset)
         
         train_loader = DataLoader(
             train_subset,
@@ -363,139 +397,209 @@ def train_on_subsets(args, model, full_dataset, device):
             Subset(full_dataset, val_idx),
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=min(1, args.num_workers),
+            num_workers=min(2, args.num_workers),
             persistent_workers=args.num_workers > 0
         )
         
-        # Configure optimizer with weight decay
+        # Configure optimizer
         trainable_params = filter(lambda p: p.requires_grad, model.parameters())
         optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-        
-        # Resume optimizer state if continuing same subset group
-        if i > start and subset_group == prev_group:
-            try:
-                checkpoint_path = os.path.join(args.checkpoint_dir, f'best_model_subset_{i-1}.pth')
-                if os.path.exists(checkpoint_path):
-                    checkpoint = torch.load(checkpoint_path, map_location=device)
-                    if 'optimizer_state_dict' in checkpoint:
-                        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                        print("🔄 Resuming optimizer state")
-            except Exception as e:
-                print(f"⚠️ Optimizer state not loaded: {str(e)}")
-
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.5, patience=2
+            optimizer, mode='max', factor=0.25, patience=1
         )
         
-        # Early stopping tracking per subset
+        # Early stopping tracking
         subset_best_acc = 0.0
         subset_early_stop = 0
         
         for epoch in range(args.epochs_per_subset):
-            print(f"\nEpoch {epoch+1}/{args.epochs_per_subset} (Subset {i+1}, Group {subset_group})")
+            print(f"\nEpoch {epoch+1}/{args.epochs_per_subset} (Subset {subset_idx+1}, Group {subset_group})")
             start_time = time.time()
             
             train_loss, train_acc = train_epoch(
-                model, train_loader, optimizer, nn.CrossEntropyLoss(), device, args.mixup_alpha
+                model, train_loader, optimizer, nn.CrossEntropyLoss(), device
             )
             
-            val_loss, val_acc, class_metrics, cm = validate(
+            val_results = evaluate(
                 model, val_loader, class_names, nn.CrossEntropyLoss(), device
             )
             
-            scheduler.step(val_acc)
+            scheduler.step(val_results['accuracy'])
             
-            # Save history with additional metrics
+            # Save history
             history.append({
-                'subset': i,
+                'subset': subset_idx,
                 'subset_group': subset_group,
                 'epoch': epoch,
                 'train_loss': train_loss,
                 'train_acc': train_acc,
-                'val_loss': val_loss,
-                'val_acc': val_acc,
-                'class_metrics': class_metrics,
+                'val_loss': val_results['loss'],
+                'val_acc': val_results['accuracy'],
+                'top5_acc': val_results['top5_accuracy'],
+                'mAP': val_results['mAP'],
+                'AUROC': val_results['AUROC'],
+                'class_metrics': val_results['classification_report'],
                 'lr': optimizer.param_groups[0]['lr'],
                 'trainable_params': sum(p.numel() for p in model.parameters() if p.requires_grad),
-                'confusion_matrix': cm.tolist()  # Save normalized confusion matrix
+                'confusion_matrix': val_results['confusion_matrix'].tolist()
             })
             
             # Early stopping check
-            if val_acc > subset_best_acc:
-                subset_best_acc = val_acc
+            if val_results['accuracy'] > subset_best_acc:
+                subset_best_acc = val_results['accuracy']
                 subset_early_stop = 0
                 best_model_state = model.state_dict()
+                
+                # Save checkpoint
+                checkpoint_path = os.path.join(args.checkpoint_dir, f'best_model_subset_{subset_idx}.pth')
+                torch.save({
+                    'model_state_dict': best_model_state,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'subset': subset_idx,
+                    'group': subset_group,
+                    'val_acc': subset_best_acc,
+                    'class_names': class_names
+                }, checkpoint_path)
             else:
                 subset_early_stop += 1
                 if subset_early_stop >= args.early_stopping:
-                    print(f"🛑 Early stopping triggered for subset {i} after {epoch+1} epochs")
+                    print(f"🛑 Early stopping triggered for subset {subset_idx} after {epoch+1} epochs")
                     break
-            
-            # Enhanced checkpoint saving
-            if val_acc > best_acc:
-                best_acc = val_acc
-                checkpoint_path = os.path.join(args.checkpoint_dir, f'best_model_subset_{i}.pth')
-                temp_path = f"{checkpoint_path}.tmp"
-                
-                try:
-                    checkpoint = {
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'subset': i,
-                        'epoch': epoch,
-                        'val_acc': val_acc,
-                        'class_metrics': class_metrics,
-                        'args': vars(args),
-                        'group': subset_group,
-                        'class_names': class_names
-                    }
-                    
-                    torch.save(checkpoint, temp_path)
-                    os.replace(temp_path, checkpoint_path)
-                    print(f"💾 Saved checkpoint for subset {i} (Group {subset_group})")
-                    
-                except Exception as e:
-                    print(f"🔥 ERROR SAVING CHECKPOINT: {str(e)}")
-                    emergency_path = f"/tmp/emergency_subset_{i}.pth"
-                    torch.save({
-                        'model_state_dict': model.state_dict(),
-                        'group': subset_group,
-                        'epoch': epoch,
-                        'val_acc': val_acc
-                    }, emergency_path)
-                    print(f"🚨 EMERGENCY BACKUP SAVED TO: {emergency_path}")
             
             # Print metrics
             epoch_time = time.time() - start_time
             print(f"Train Loss: {train_loss:.4f} | Acc: {train_acc:.2%}")
-            print(f"Val Loss: {val_loss:.4f} | Acc: {val_acc:.2%}")
+            print(f"Val Loss: {val_results['loss']:.4f} | Acc: {val_results['accuracy']:.2%}")
+            print(f"Top-5 Acc: {val_results['top5_accuracy']:.2%} | mAP: {val_results['mAP']:.2%}")
             print(f"Time: {epoch_time:.1f}s | LR: {optimizer.param_groups[0]['lr']:.2e}")
-            print(f"Trainable params: {history[-1]['trainable_params']:,}")
             
-            # Log top/bottom classes
-            sorted_classes = sorted(class_metrics.items(), key=lambda x: x[1]['f1-score'], reverse=True)
-            print("\nTop 3 Classes:")
-            for cls, metrics in sorted_classes[:3]:
-                print(f"{cls}: Precision={metrics['precision']:.2f}, Recall={metrics['recall']:.2f}, F1={metrics['f1-score']:.2f}")
-            
-            print("\nBottom 3 Classes:")
-            for cls, metrics in sorted_classes[-3:]:
-                print(f"{cls}: Precision={metrics['precision']:.2f}, Recall={metrics['recall']:.2f}, F1={metrics['f1-score']:.2f}")
+            # Optionally evaluate on test set during training
+            if test_loader and epoch % 2 == 0:  # Every 2 epochs
+                test_results = evaluate(
+                    model, test_loader, class_names, nn.CrossEntropyLoss(), device
+                )
+                print(f"\nTest Acc: {test_results['accuracy']:.2%} | Top-5: {test_results['top5_accuracy']:.2%}")
     
     return history
 
-def save_plots(history, class_names, checkpoint_dir):
+def save_plots(history, class_names, checkpoint_dir, test_results=None):
     """Save comprehensive training plots and metrics"""
-    df = pd.DataFrame(history)
-    
-    # Create plot directory
+    # Create plot directories
     plot_dir = os.path.join(checkpoint_dir, 'plots')
     os.makedirs(plot_dir, exist_ok=True)
     
-    # 1. Training and Validation Metrics
+    if test_results:
+        confidence_plot_dir = os.path.join(plot_dir, 'confidence_plots')
+        os.makedirs(confidence_plot_dir, exist_ok=True)
+        
+        # 1. Mean Confidence per Species
+        plt.figure(figsize=(12, 6))
+        x = np.arange(len(class_names))
+        width = 0.35
+        plt.bar(x - width/2, test_results['confidence_metrics']['mean_confidence_per_class']['correct'], 
+                width, label='Correct Predictions')
+        plt.bar(x + width/2, test_results['confidence_metrics']['mean_confidence_per_class']['incorrect'], 
+                width, label='Incorrect Predictions')
+        plt.xticks(x, class_names, rotation=90)
+        plt.xlabel('Class')
+        plt.ylabel('Mean Confidence')
+        plt.title('Mean Confidence by Prediction Correctness')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(confidence_plot_dir, 'mean_confidence_per_class.png'))
+        plt.close()
+        
+        # 2. Confidence Histograms
+        plt.figure(figsize=(12, 6))
+        bins = test_results['confidence_metrics']['confidence_distribution']['bins']
+        plt.hist(test_results['predictions']['confidences'], bins=bins, alpha=0.5, label='All')
+        # Corrected histogram plotting
+        plt.hist([c for c, m in zip(test_results['predictions']['confidences'], 
+                                test_results['predictions']['true_labels'] == test_results['predictions']['pred_labels']) if m], 
+                bins=bins, alpha=0.5, label='Correct')
+        plt.hist([c for c, m in zip(test_results['predictions']['confidences'], 
+                                test_results['predictions']['true_labels'] != test_results['predictions']['pred_labels']) if m], 
+                bins=bins, alpha=0.5, label='Incorrect')
+        plt.xlabel('Confidence')
+        plt.ylabel('Count')
+        plt.title('Confidence Distribution')
+        plt.legend()
+        plt.savefig(os.path.join(confidence_plot_dir, 'confidence_histogram.png'))
+        plt.close()
+        
+        # 3. Calibration Curve
+        plt.figure(figsize=(8, 8))
+        plt.plot([0, 1], [0, 1], 'k--', label='Perfectly Calibrated')
+        calib = test_results['confidence_metrics']['calibration']
+        plt.plot(calib['bin_confidences'], calib['bin_accuracies'], 's-', 
+                label=f'Model (ECE={calib["ece"]:.3f})')
+        plt.xlabel('Mean Predicted Confidence')
+        plt.ylabel('Actual Accuracy')
+        plt.title('Calibration Curve')
+        plt.legend()
+        plt.savefig(os.path.join(confidence_plot_dir, 'calibration_curve.png'))
+        plt.close()
+        
+        # 4. Top-k Accuracy
+        plt.figure(figsize=(8, 6))
+        plt.plot(range(1, 6), test_results['confidence_metrics']['topk_accuracies'], 'o-')
+        plt.xlabel('k')
+        plt.ylabel('Accuracy')
+        plt.title('Top-k Accuracy')
+        plt.xticks(range(1, 6))
+        plt.savefig(os.path.join(confidence_plot_dir, 'topk_accuracy.png'))
+        plt.close()
+        
+        # 5. Rejection Curve
+        thresholds = [m['threshold'] for m in test_results['confidence_metrics']['rejection_curve']]
+        accuracies = [m['accuracy'] for m in test_results['confidence_metrics']['rejection_curve']]
+        rejections = [m['rejection_rate'] for m in test_results['confidence_metrics']['rejection_curve']]
+        
+        plt.figure(figsize=(12, 6))
+        plt.subplot(1, 2, 1)
+        plt.plot(thresholds, accuracies, 'o-')
+        plt.xlabel('Confidence Threshold')
+        plt.ylabel('Accuracy')
+        plt.title('Accuracy vs Confidence Threshold')
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(thresholds, rejections, 'o-')
+        plt.xlabel('Confidence Threshold')
+        plt.ylabel('Rejection Rate')
+        plt.title('Rejection Rate vs Confidence Threshold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(confidence_plot_dir, 'rejection_curve.png'))
+        plt.close()
+        
+        # 6. Class-Level Confidence Variance
+        plt.figure(figsize=(12, 6))
+        plt.bar(class_names, test_results['confidence_metrics']['class_confidence_variability'])
+        plt.xticks(rotation=90)
+        plt.ylabel('Standard Deviation of Confidence')
+        plt.title('Confidence Variability by Class')
+        plt.tight_layout()
+        plt.savefig(os.path.join(confidence_plot_dir, 'class_confidence_variability.png'))
+        plt.close()
+        
+        # 7. Confidence Gap
+        plt.figure(figsize=(12, 6))
+        gaps = test_results['predictions']['confidence_gaps']
+        preds = test_results['predictions']['pred_labels']
+        plt.boxplot([gaps[preds == i] for i in range(len(class_names))], 
+                    labels=class_names)
+        plt.xticks(rotation=90)
+        plt.ylabel('Confidence Gap (Top1 - Top2)')
+        plt.title('Confidence Gap Distribution by Class')
+        plt.tight_layout()
+        plt.savefig(os.path.join(confidence_plot_dir, 'confidence_gap.png'))
+        plt.close()
+    
+    # Original training plots
+    df = pd.DataFrame(history)
+    
+    # Training and Validation Metrics
     plt.figure(figsize=(15, 10))
     
-    # Accuracy plot
     plt.subplot(2, 2, 1)
     for subset in df['subset'].unique():
         subset_data = df[df['subset'] == subset]
@@ -505,7 +609,6 @@ def save_plots(history, class_names, checkpoint_dir):
     plt.title('Accuracy Across Subsets')
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     
-    # Loss plot
     plt.subplot(2, 2, 2)
     for subset in df['subset'].unique():
         subset_data = df[df['subset'] == subset]
@@ -515,7 +618,6 @@ def save_plots(history, class_names, checkpoint_dir):
     plt.title('Loss Across Subsets')
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     
-    # Learning rate plot
     plt.subplot(2, 2, 3)
     for subset in df['subset'].unique():
         subset_data = df[df['subset'] == subset]
@@ -526,15 +628,15 @@ def save_plots(history, class_names, checkpoint_dir):
     plt.title('Learning Rate Schedule')
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     
-    # F1-scores by class
     plt.subplot(2, 2, 4)
     all_class_metrics = []
     for _, row in df.iterrows():
         for class_name, metrics in row['class_metrics'].items():
-            metrics['class'] = class_name
-            metrics['subset'] = row['subset']
-            metrics['epoch'] = row['epoch']
-            all_class_metrics.append(metrics)
+            if class_name in class_names:  # Only include actual classes
+                metrics['class'] = class_name
+                metrics['subset'] = row['subset']
+                metrics['epoch'] = row['epoch']
+                all_class_metrics.append(metrics)
     
     class_df = pd.DataFrame(all_class_metrics)
     final_metrics = class_df.groupby(['class', 'subset']).last().reset_index()
@@ -547,7 +649,7 @@ def save_plots(history, class_names, checkpoint_dir):
     plt.savefig(os.path.join(plot_dir, 'training_metrics.png'), bbox_inches='tight')
     plt.close()
     
-    # 2. Confusion Matrix from last epoch
+    # Confusion Matrix from last epoch
     last_confusion = history[-1]['confusion_matrix']
     plt.figure(figsize=(12, 10))
     sns.heatmap(last_confusion, annot=True, fmt='.2f', cmap='Blues',
@@ -557,80 +659,134 @@ def save_plots(history, class_names, checkpoint_dir):
     plt.ylabel('True')
     plt.savefig(os.path.join(plot_dir, 'confusion_matrix.png'))
     plt.close()
-    
-    # 3. Class-wise metric trends
-    plt.figure(figsize=(15, 8))
-    for i, metric in enumerate(['precision', 'recall', 'f1-score']):
-        plt.subplot(1, 3, i+1)
-        for cls in class_names[:10]:  # Plot first 10 classes for clarity
-            cls_data = class_df[class_df['class'] == cls]
-            plt.plot(cls_data['epoch'], cls_data[metric], label=cls)
-        plt.xlabel('Epoch')
-        plt.ylabel(metric.capitalize())
-        plt.title(f'{metric.capitalize()} Trends')
-        if i == 2:
-            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    plt.savefig(os.path.join(plot_dir, 'class_metrics.png'), bbox_inches='tight')
-    plt.close()
 
 def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Using device: {device}")
     
-    # Load dataset
+    # Load and filter dataset
     print("📦 Loading data...")
     full_dataset = datasets.ImageFolder(args.data_dir)
-    class_dist = get_class_distribution(full_dataset)
-    print("📊 Initial class distribution:", json.dumps(class_dist, indent=2))
     
     # Filter classes with insufficient samples
+    class_counts = defaultdict(int)
+    for _, label in full_dataset.samples:
+        class_counts[label] += 1
+    
     valid_classes = []
     excluded_classes = []
-    for cls, count in class_dist.items():
-        if count >= args.min_samples:
+    for cls, idx in full_dataset.class_to_idx.items():
+        if class_counts.get(idx, 0) >= args.min_samples:
             valid_classes.append(cls)
         else:
             excluded_classes.append(cls)
     
-    # Filter the dataset to only include valid classes
-    valid_class_indices = [full_dataset.class_to_idx[cls] for cls in valid_classes]
-    valid_samples = [
-        (path, valid_class_indices.index(label)) 
-        for path, label in full_dataset.samples 
-        if label in [full_dataset.class_to_idx[cls] for cls in valid_classes]
-    ]
-    
-    # Create new dataset with only valid classes
-    filtered_dataset = datasets.ImageFolder(args.data_dir)
-    filtered_dataset.samples = valid_samples
-    filtered_dataset.targets = [s[1] for s in valid_samples]
-    filtered_dataset.classes = valid_classes
-    filtered_dataset.class_to_idx = {cls: i for i, cls in enumerate(valid_classes)}
-    
+    print(f"\n📊 Original class count: {len(full_dataset.classes)}")
     print(f"🚫 Excluded {len(excluded_classes)} classes with < {args.min_samples} samples:")
     print(excluded_classes)
+    print(f"✅ Using {len(valid_classes)} valid classes")
+    
+    # Filter the dataset to only include valid classes
+    valid_class_indices = [full_dataset.class_to_idx[cls] for cls in valid_classes]
+    filtered_samples = [
+        (path, valid_class_indices.index(label))
+        for path, label in full_dataset.samples
+        if label in valid_class_indices
+    ]
+
+    # Create filtered dataset
+    filtered_dataset = datasets.ImageFolder(args.data_dir)
+    filtered_dataset.samples = filtered_samples
+    filtered_dataset.targets = [s[1] for s in filtered_samples]
+    filtered_dataset.classes = valid_classes
+    filtered_dataset.class_to_idx = {cls: i for i, cls in enumerate(valid_classes)}
     print("📊 Filtered class distribution:", json.dumps(get_class_distribution(filtered_dataset), indent=2))
     
-    # Initialize model with filtered classes
-    print("🧠 Initializing model...")
-    initial_subset_group = (int(args.subset_range.split('-')[0]) // 5) + 1
-    model = setup_model(len(filtered_dataset.classes), device, initial_subset_group)
+    # Now split the FILTERED dataset into train+val and test
+    trainval_idx, test_idx = train_test_split(
+        list(range(len(filtered_samples))),
+        test_size=args.test_split,
+        stratify=[s[1] for s in filtered_samples],
+        random_state=42
+    )
+
+    # Create final train+val dataset
+    trainval_dataset = datasets.ImageFolder(args.data_dir)
+    trainval_dataset.samples = [filtered_samples[i] for i in trainval_idx]
+    trainval_dataset.targets = [s[1] for s in trainval_dataset.samples]
+    trainval_dataset.classes = valid_classes
+    trainval_dataset.class_to_idx = {cls: i for i, cls in enumerate(valid_classes)}
+
+    # Create test dataset
+    test_dataset = datasets.ImageFolder(args.data_dir)
+    test_dataset.samples = [filtered_samples[i] for i in test_idx]
+    test_dataset.targets = [s[1] for s in test_dataset.samples]
+    test_dataset.classes = valid_classes
+    test_dataset.class_to_idx = {cls: i for i, cls in enumerate(valid_classes)}
+
+    print(f"\n📊 Final train+val size: {len(trainval_dataset)} samples")
+    print(f"🧪 Test set size: {len(test_dataset)} samples")
+    print("📊 Test set distribution:", json.dumps(get_class_distribution(test_dataset), indent=2))
     
-    # Use filtered_dataset instead of full_dataset for training
-    history = train_on_subsets(args, model, filtered_dataset, device)
+    # Create test loader
+    test_transform = transforms.Compose([
+        transforms.Resize(448),
+        transforms.CenterCrop(384),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    test_dataset.transform = test_transform  # Directly set transform on test_dataset
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=min(2, args.num_workers)
+    )
+    
+    # Initialize model
+    print("🧠 Initializing model...")
+    model = setup_model(len(trainval_dataset.classes), device, subset_group=1)
+    
+    # Create checkpoint directory
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    
+    # Train on subsets
+    history = train_on_subsets(args, model, trainval_dataset, device, test_loader)
+    
+    # Final evaluation on test set
+    print("\n🏆 Final evaluation on test set...")
+    test_results = evaluate(
+        model, test_loader, trainval_dataset.classes, nn.CrossEntropyLoss(), device
+    )
+    
+    print("\n📊 Test Set Metrics:")
+    print(f"Accuracy: {test_results['accuracy']:.2%}")
+    print(f"Top-5 Accuracy: {test_results['top5_accuracy']:.2%}")
+    print(f"mAP: {test_results['mAP']:.2%}")
+    print(f"AUROC: {test_results['AUROC']:.2%}")
     
     # Save results
-    print("\n🏆 Training complete! Saving results...")
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    print("\n💾 Saving results...")
     with open(os.path.join(args.checkpoint_dir, 'training_history.json'), 'w') as f:
         json.dump(history, f)
     
+    with open(os.path.join(args.checkpoint_dir, 'test_results.json'), 'w') as f:
+        json.dump(test_results, f)
+    
     # Generate plots
     if len(history) > 0:
-        save_plots(history, full_dataset.classes, args.checkpoint_dir)
+        save_plots(history, trainval_dataset.classes, args.checkpoint_dir)
         print(f"📊 Saved training plots to {args.checkpoint_dir}/plots/")
+    
+    # Save final model
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'class_names': trainval_dataset.classes,
+        'test_metrics': test_results
+    }, os.path.join(args.checkpoint_dir, 'final_model.pth'))
+    
+    print("\n🎉 Training complete!")
 
 if __name__ == "__main__":
     torch.multiprocessing.set_sharing_strategy('file_system')
