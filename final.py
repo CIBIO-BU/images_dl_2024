@@ -24,13 +24,13 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True  # Handle corrupted images
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Progressive ResNet50 Wildlife Classification')
-    parser.add_argument('--data-dir', type=str, default='snapshot_safari_10k_crops_deduped', help='Path to dataset directory')
+    parser.add_argument('--data-dir', type=str, default='wcs_cropped_download', help='Path to dataset directory')
     parser.add_argument('--epochs-per-subset', type=int, default=15, help='Epochs per subset')
-    parser.add_argument('--batch-size', type=int, default=64, help='Batch size for training')
+    parser.add_argument('--batch-size', type=int, default=8, help='Batch size for training')
     parser.add_argument('--lr', type=float, default=0.0001, help='Initial learning rate')
-    parser.add_argument('--min-samples', type=int, default=3000, help='Minimum samples per class')
-    parser.add_argument('--num-subsets', type=int, default=4, help='Number of data subsets (groups)')
-    parser.add_argument('--num-workers', type=int, default=0, help='Number of data loader workers')
+    parser.add_argument('--min-samples', type=int, default=7000, help='Minimum samples per class')
+    parser.add_argument('--num-subsets', type=int, default=1, help='Number of data subsets (groups)')
+    parser.add_argument('--num-workers', type=int, default=1, help='Number of data loader workers')
     parser.add_argument('--checkpoint-dir', type=str, default='checkpoints_4_subsets', help='Directory to save checkpoints')
     parser.add_argument('--early-stopping', type=int, default=10, help='Patience for early stopping')
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay for optimizer')
@@ -38,6 +38,18 @@ def parse_args():
     parser.add_argument('--test-split', type=float, default=0.1, help='Fraction of data to use as test set')
     return parser.parse_args()
 
+def convert(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.integer, np.floating)):
+        return obj.item()
+    elif isinstance(obj, dict):
+        return {k: convert(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert(i) for i in obj]
+    else:
+        return obj
+    
 def validate_subsets(subsets, full_dataset):
     """Ensure all subsets contain all classes"""
     all_classes = set(range(len(full_dataset.classes)))
@@ -46,14 +58,17 @@ def validate_subsets(subsets, full_dataset):
         if subset_classes != all_classes:
             raise ValueError(f"Subset {i} missing classes! Expected {all_classes}, got {subset_classes}")
     print("✅ All subsets contain all classes")
-
+    
 def create_subsets(dataset, n_splits=4):
     """Split data into balanced subsets ensuring all classes are present"""
+    if n_splits == 1:
+        print("📂 Using full dataset as a single subset.")
+        return [Subset(dataset, list(range(len(dataset))))]
+
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     labels = [label for (_, label) in dataset.samples]
     subsets = []
-    
-    # First create the initial splits
+
     initial_splits = []
     for _, subset_indices in skf.split(np.zeros(len(labels)), labels):
         subset_classes = set([labels[i] for i in subset_indices])
@@ -61,13 +76,12 @@ def create_subsets(dataset, n_splits=4):
             print(f"⚠️ Subset missing classes! Expected {len(dataset.classes)}, found {len(subset_classes)}")
             continue
         initial_splits.append(subset_indices)
-    
-    # Create progressive subsets (each new subset includes previous data)
+
     combined_indices = []
     for i in range(n_splits):
         combined_indices = list(initial_splits[i]) + combined_indices
         subsets.append(Subset(dataset, combined_indices))
-    
+
     return subsets
 
 def get_class_distribution(dataset):
@@ -98,27 +112,10 @@ def setup_model(num_classes, device, subset_group=1):
     
     # First freeze all parameters
     for param in model.parameters():
-        param.requires_grad = False
-    
-    # Then selectively unfreeze based on subset group
-    if subset_group >= 1:
-        for param in model.fc.parameters():
-            param.requires_grad = True
-    
-    if subset_group >= 2:
-        for param in model.layer4.parameters():
-            param.requires_grad = True
-    
-    if subset_group >= 3:
-        for param in model.layer3.parameters():
-            param.requires_grad = True
-    
-    if subset_group >= 4:
-        for param in model.parameters():  # Unfreeze all
-            param.requires_grad = True
+        param.requires_grad = True
     
     model = model.to(device)
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    trainable_params = sum(p.numel() for p in model.parameters())
     print(f"🔧 Model setup: Group {subset_group}, Trainable params: {trainable_params:,}")
     return model
 
@@ -210,9 +207,13 @@ def evaluate(model, loader, class_names, criterion, device):
         if np.sum(in_bin) > 0:
             bin_acc = np.mean(all_preds[in_bin] == all_labels[in_bin])
             bin_conf = np.mean(confidences[in_bin])
-            bin_centers.append((conf_bins[i] + conf_bins[i+1]) / 2)
-            bin_accuracies.append(bin_acc)
-            bin_confidences.append(bin_conf)
+        else:
+            bin_acc = 0.0  # or np.nan
+            bin_conf = 0.0  # or np.nan
+        bin_centers.append((conf_bins[i] + conf_bins[i+1]) / 2)
+        bin_accuracies.append(bin_acc)
+        bin_confidences.append(bin_conf)
+
     
     # Calculate Expected Calibration Error (ECE)
     ece = np.sum(np.abs(np.array(bin_accuracies) - np.array(bin_confidences)) * 
@@ -480,7 +481,7 @@ def train_on_subsets(args, model, full_dataset, device, test_loader=None):
                 )
                 print(f"\nTest Acc: {test_results['accuracy']:.2%} | Top-5: {test_results['top5_accuracy']:.2%}")
     
-    return history
+    return history, model
 
 def save_plots(history, class_names, checkpoint_dir, test_results=None):
     """Save comprehensive training plots and metrics"""
@@ -752,12 +753,12 @@ def main():
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     
     # Train on subsets
-    history = train_on_subsets(args, model, trainval_dataset, device, test_loader)
+    history, trained_model = train_on_subsets(args, model, trainval_dataset, device, test_loader)
     
     # Final evaluation on test set
     print("\n🏆 Final evaluation on test set...")
     test_results = evaluate(
-        model, test_loader, trainval_dataset.classes, nn.CrossEntropyLoss(), device
+        trained_model, test_loader, trainval_dataset.classes, nn.CrossEntropyLoss(), device
     )
     
     print("\n📊 Test Set Metrics:")
@@ -771,14 +772,14 @@ def main():
     with open(os.path.join(args.checkpoint_dir, 'training_history.json'), 'w') as f:
         json.dump(history, f)
     
-    with open(os.path.join(args.checkpoint_dir, 'test_results.json'), 'w') as f:
-        json.dump(test_results, f)
-    
     # Generate plots
     if len(history) > 0:
-        save_plots(history, trainval_dataset.classes, args.checkpoint_dir)
+        save_plots(history, trainval_dataset.classes, args.checkpoint_dir, test_results)
         print(f"📊 Saved training plots to {args.checkpoint_dir}/plots/")
     
+    with open(os.path.join(args.checkpoint_dir, 'test_results.json'), 'w') as f:
+        json.dump(convert(test_results), f, indent=2)
+
     # Save final model
     torch.save({
         'model_state_dict': model.state_dict(),
