@@ -28,14 +28,16 @@ def parse_args():
     parser.add_argument('--epochs-per-subset', type=int, default=15, help='Epochs per subset')
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size for training')
     parser.add_argument('--lr', type=float, default=0.0001, help='Initial learning rate')
-    parser.add_argument('--min-samples', type=int, default=7000, help='Minimum samples per class')
+    parser.add_argument('--min-samples', type=int, default=5000, help='Minimum samples per class')
     parser.add_argument('--num-subsets', type=int, default=1, help='Number of data subsets (groups)')
     parser.add_argument('--num-workers', type=int, default=1, help='Number of data loader workers')
-    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints_4_subsets', help='Directory to save checkpoints')
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints_cv', help='Directory to save checkpoints')
     parser.add_argument('--early-stopping', type=int, default=10, help='Patience for early stopping')
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay for optimizer')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate')
     parser.add_argument('--test-split', type=float, default=0.1, help='Fraction of data to use as test set')
+    parser.add_argument('--cv-folds', type=int, default=10, help='If >0, run classical stratified k-fold cross-validation with this many folds (disables progressive subsets).')
+
     return parser.parse_args()
 
 def convert(obj):
@@ -483,6 +485,160 @@ def train_on_subsets(args, model, full_dataset, device, test_loader=None):
     
     return history, model
 
+def train_with_cross_validation(args, model, full_dataset, device, test_loader=None):
+    """
+    Stratified K-Fold cross-validation training.
+    Uses the same train/eval pipeline as subsets, but per-fold.
+    - Resets the model at the start of each fold (transfer learning from ImageNet each time).
+    - Early-stopping and ReduceLROnPlateau per fold.
+    - Saves best checkpoint per fold to args.checkpoint_dir/best_model_fold_{k}.pth
+    Returns:
+        history: list of per-epoch records (compatible with save_plots)
+        best_model: the model state dict of the best fold by val accuracy
+    """
+    skf = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=42)
+    labels = [lbl for _, lbl in full_dataset.samples]
+    class_names = full_dataset.classes
+
+    history = []
+    best_overall_acc = -1.0
+    best_model_state = None
+    best_fold_id = None
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(labels)), labels)):
+        print(f"\n🧩 Fold {fold+1}/{args.cv_folds}")
+        print(f"📊 Train size: {len(train_idx)} | Val size: {len(val_idx)}")
+
+        # Fresh model each fold (transfer learning init)
+        model = setup_model(num_classes=len(class_names), device=device, subset_group=1)
+
+        # Transforms (reuse your originals)
+        train_transform = transforms.Compose([
+            transforms.RandomResizedCrop(384, scale=(0.6, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(30),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
+            transforms.RandomAffine(degrees=15, translate=(0.2, 0.2)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+        val_transform = transforms.Compose([
+            transforms.Resize(448),
+            transforms.CenterCrop(384),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
+
+        # Datasets + loaders for this fold
+        full_dataset.transform = train_transform
+        train_subset = Subset(full_dataset, train_idx)
+        sampler = get_weighted_sampler(train_subset)
+        train_loader = DataLoader(
+            train_subset,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=args.num_workers > 0
+        )
+
+        full_dataset.transform = val_transform
+        val_loader = DataLoader(
+            Subset(full_dataset, val_idx),
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=min(2, args.num_workers),
+            persistent_workers=args.num_workers > 0
+        )
+
+        # Optimizer / scheduler
+        trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+        optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.25, patience=1
+        )
+
+        # Early stopping per fold
+        fold_best_acc = -1.0
+        fold_patience = 0
+        criterion = nn.CrossEntropyLoss()
+
+        for epoch in range(args.epochs_per_subset):
+            print(f"\nEpoch {epoch+1}/{args.epochs_per_subset} (Fold {fold+1})")
+            start_time = time.time()
+
+            train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
+            val_results = evaluate(model, val_loader, class_names, criterion, device)
+            scheduler.step(val_results['accuracy'])
+
+            # Save history row (keep keys compatible with save_plots)
+            history.append({
+                'subset': fold,                     # treat "fold" as "subset" for plotting compatibility
+                'subset_group': 1,                  # not used here but kept for consistency
+                'epoch': epoch,
+                'train_loss': train_loss,
+                'train_acc': train_acc,
+                'val_loss': val_results['loss'],
+                'val_acc': val_results['accuracy'],
+                'top5_acc': val_results['top5_accuracy'],
+                'mAP': val_results['mAP'],
+                'AUROC': val_results['AUROC'],
+                'class_metrics': val_results['classification_report'],
+                'lr': optimizer.param_groups[0]['lr'],
+                'trainable_params': sum(p.numel() for p in model.parameters() if p.requires_grad),
+                'confusion_matrix': val_results['confusion_matrix'].tolist()
+            })
+
+            # Track fold best / early stopping
+            if val_results['accuracy'] > fold_best_acc:
+                fold_best_acc = val_results['accuracy']
+                fold_patience = 0
+                # Save best for this fold
+                ckpt_path = os.path.join(args.checkpoint_dir, f'best_model_fold_{fold}.pth')
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'fold': fold,
+                    'val_acc': fold_best_acc,
+                    'class_names': class_names
+                }, ckpt_path)
+            else:
+                fold_patience += 1
+                if fold_patience >= args.early_stopping:
+                    print(f"🛑 Early stopping triggered for fold {fold} after {epoch+1} epochs")
+                    break
+
+            # Log epoch summary
+            elapsed = time.time() - start_time
+            print(f"Train Loss: {train_loss:.4f} | Acc: {train_acc:.2%}")
+            print(f"Val   Loss: {val_results['loss']:.4f} | Acc: {val_results['accuracy']:.2%}")
+            print(f"Top-5: {val_results['top5_accuracy']:.2%} | mAP: {val_results['mAP']:.2%} | AUROC: {val_results['AUROC']:.2%}")
+            report = val_results['classification_report']
+            per_class_acc = [(cls, metrics['recall']) for cls, metrics in report.items() if cls in class_names]
+            lowest_5 = sorted(per_class_acc, key=lambda x: x[1])[:5]
+            print("\n📈 Worst 5 classes by accuracy (recall):")
+            for cls, acc in lowest_5:
+                print(f"{cls}: {acc:.2%}")
+            print(f"Time: {elapsed:.1f}s | LR: {optimizer.param_groups[0]['lr']:.2e}")
+
+        # Track overall best fold
+        if fold_best_acc > best_overall_acc:
+            best_overall_acc = fold_best_acc
+            best_fold_id = fold
+            best_model_state = model.state_dict().copy()
+
+    # Load the best fold state into a fresh model to return
+    best_model = setup_model(num_classes=len(class_names), device=device, subset_group=1)
+    if best_model_state is not None:
+        best_model.load_state_dict(best_model_state, strict=False)
+        print(f"\n🏅 Best fold: {best_fold_id+1} with Val Acc = {best_overall_acc:.2%}")
+    else:
+        print("\n⚠️ No best fold state captured; returning last model.")
+
+    return history, best_model
+
+
 def save_plots(history, class_names, checkpoint_dir, test_results=None):
     """Save comprehensive training plots and metrics"""
     # Create plot directories
@@ -513,14 +669,15 @@ def save_plots(history, class_names, checkpoint_dir, test_results=None):
         # 2. Confidence Histograms
         plt.figure(figsize=(12, 6))
         bins = test_results['confidence_metrics']['confidence_distribution']['bins']
-        plt.hist(test_results['predictions']['confidences'], bins=bins, alpha=0.5, label='All')
-        # Corrected histogram plotting
-        plt.hist([c for c, m in zip(test_results['predictions']['confidences'], 
-                                test_results['predictions']['true_labels'] == test_results['predictions']['pred_labels']) if m], 
-                bins=bins, alpha=0.5, label='Correct')
-        plt.hist([c for c, m in zip(test_results['predictions']['confidences'], 
-                                test_results['predictions']['true_labels'] != test_results['predictions']['pred_labels']) if m], 
-                bins=bins, alpha=0.5, label='Incorrect')
+
+        confidences = np.array(test_results['predictions']['confidences'])
+        true = np.array(test_results['predictions']['true_labels'])
+        pred = np.array(test_results['predictions']['pred_labels'])
+        correct_mask = (true == pred)
+
+        plt.hist(confidences, bins=bins, alpha=0.5, label='All')
+        plt.hist(confidences[correct_mask], bins=bins, alpha=0.5, label='Correct')
+        plt.hist(confidences[~correct_mask], bins=bins, alpha=0.5, label='Incorrect')
         plt.xlabel('Confidence')
         plt.ylabel('Count')
         plt.title('Confidence Distribution')
@@ -584,17 +741,17 @@ def save_plots(history, class_names, checkpoint_dir, test_results=None):
         
         # 7. Confidence Gap
         plt.figure(figsize=(12, 6))
-        gaps = test_results['predictions']['confidence_gaps']
-        preds = test_results['predictions']['pred_labels']
-        plt.boxplot([gaps[preds == i] for i in range(len(class_names))], 
-                    labels=class_names)
+        gaps = np.array(test_results['predictions']['confidence_gaps'])
+        preds = np.array(test_results['predictions']['pred_labels'])
+        box_data = [gaps[preds == i] for i in range(len(class_names))]
+        plt.boxplot(box_data, labels=class_names)
         plt.xticks(rotation=90)
         plt.ylabel('Confidence Gap (Top1 - Top2)')
         plt.title('Confidence Gap Distribution by Class')
         plt.tight_layout()
         plt.savefig(os.path.join(confidence_plot_dir, 'confidence_gap.png'))
         plt.close()
-    
+
     # Original training plots
     df = pd.DataFrame(history)
     
@@ -748,13 +905,18 @@ def main():
     # Initialize model
     print("🧠 Initializing model...")
     model = setup_model(len(trainval_dataset.classes), device, subset_group=1)
-    
+
     # Create checkpoint directory
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    
-    # Train on subsets
-    history, trained_model = train_on_subsets(args, model, trainval_dataset, device, test_loader)
-    
+
+    # === Choose training mode ===
+    if args.cv_folds and args.cv_folds > 0:
+        print(f"\n🔁 Running stratified {args.cv_folds}-fold cross-validation...")
+        history, trained_model = train_with_cross_validation(args, model, trainval_dataset, device, test_loader)
+    else:
+        print("\n🌀 Running progressive subset training...")
+        history, trained_model = train_on_subsets(args, model, trainval_dataset, device, test_loader)
+
     # Final evaluation on test set
     print("\n🏆 Final evaluation on test set...")
     test_results = evaluate(
