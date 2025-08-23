@@ -752,31 +752,41 @@ def save_plots(history, class_names, checkpoint_dir, test_results=None):
         plt.savefig(os.path.join(confidence_plot_dir, 'confidence_gap.png'))
         plt.close()
 
-    # Original training plots
+    # === Separate training plots ===
     df = pd.DataFrame(history)
-    
-    # Training and Validation Metrics
-    plt.figure(figsize=(15, 10))
-    
-    plt.subplot(2, 2, 1)
+
+    # 1) Validation Accuracy across epochs (0..1)
+    plt.figure(figsize=(9, 6))
     for subset in df['subset'].unique():
         subset_data = df[df['subset'] == subset]
         plt.plot(subset_data['epoch'], subset_data['val_acc'], label=f'Subset {subset+1}')
     plt.xlabel('Epoch')
     plt.ylabel('Validation Accuracy')
-    plt.title('Accuracy Across Subsets')
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    
-    plt.subplot(2, 2, 2)
+    plt.title('Validation Accuracy Across Epochs')
+    plt.ylim(0, 1)
+    plt.grid(True, alpha=0.3)
+    plt.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig(os.path.join(plot_dir, 'val_accuracy_across_epochs.png'), bbox_inches='tight')
+    plt.close()
+
+    # 2) Validation Loss across epochs (force 0..1)
+    plt.figure(figsize=(9, 6))
     for subset in df['subset'].unique():
         subset_data = df[df['subset'] == subset]
         plt.plot(subset_data['epoch'], subset_data['val_loss'], label=f'Subset {subset+1}')
     plt.xlabel('Epoch')
     plt.ylabel('Validation Loss')
-    plt.title('Loss Across Subsets')
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    
-    plt.subplot(2, 2, 3)
+    plt.title('Validation Loss Across Epochs')
+    plt.ylim(0, 1)  # per your request (may clip if loss > 1)
+    plt.grid(True, alpha=0.3)
+    plt.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig(os.path.join(plot_dir, 'val_loss_across_epochs.png'), bbox_inches='tight')
+    plt.close()
+
+    # 3) Learning Rate schedule (own figure)
+    plt.figure(figsize=(9, 6))
     for subset in df['subset'].unique():
         subset_data = df[df['subset'] == subset]
         plt.plot(subset_data['epoch'], subset_data['lr'], label=f'Subset {subset+1}')
@@ -784,28 +794,45 @@ def save_plots(history, class_names, checkpoint_dir, test_results=None):
     plt.ylabel('Learning Rate')
     plt.yscale('log')
     plt.title('Learning Rate Schedule')
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    
-    plt.subplot(2, 2, 4)
+    plt.grid(True, which='both', alpha=0.3)
+    plt.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig(os.path.join(plot_dir, 'learning_rate_schedule.png'), bbox_inches='tight')
+    plt.close()
+
+    # 4) F1-score per class (bar plot, 0..1)
+    #    Aggregate the final F1 per class across subsets (mean of last epoch per subset)
     all_class_metrics = []
     for _, row in df.iterrows():
         for class_name, metrics in row['class_metrics'].items():
             if class_name in class_names:  # Only include actual classes
-                metrics['class'] = class_name
-                metrics['subset'] = row['subset']
-                metrics['epoch'] = row['epoch']
-                all_class_metrics.append(metrics)
-    
+                rec = dict(metrics)
+                rec['class'] = class_name
+                rec['subset'] = row['subset']
+                rec['epoch'] = row['epoch']
+                all_class_metrics.append(rec)
+
     class_df = pd.DataFrame(all_class_metrics)
-    final_metrics = class_df.groupby(['class', 'subset']).last().reset_index()
-    
-    sns.boxplot(data=final_metrics, x='class', y='f1-score')
+    # Take the last epoch per (class, subset), then average across subsets
+    final_per_subset = (class_df
+                        .sort_values(['subset', 'class', 'epoch'])
+                        .groupby(['class', 'subset'], as_index=False)
+                        .tail(1))
+    final_f1 = (final_per_subset
+                .groupby('class', as_index=False)['f1-score']
+                .mean()
+                .sort_values('f1-score', ascending=False))
+
+    plt.figure(figsize=(12, 6))
+    plt.bar(final_f1['class'], final_f1['f1-score'])
     plt.xticks(rotation=90)
-    plt.title('Final F1-scores by Class')
-    
+    plt.ylabel('F1-score')
+    plt.ylim(0, 1)
+    plt.title('Final F1-score per Class (mean across subsets)')
     plt.tight_layout()
-    plt.savefig(os.path.join(plot_dir, 'training_metrics.png'), bbox_inches='tight')
+    plt.savefig(os.path.join(plot_dir, 'f1_per_class_bar.png'), bbox_inches='tight')
     plt.close()
+
     
     # Confusion Matrix from last epoch
     last_confusion = history[-1]['confusion_matrix']
