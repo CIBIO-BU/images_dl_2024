@@ -129,6 +129,21 @@ function MainApp() {
   }
 };
 
+// Helper function for downloading JSON
+function handleDownloadJson() {
+  if (!jsonData) return;
+  const blob = new Blob([JSON.stringify(jsonData, null, 2)], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "detections.json";
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
   const showNotification = (message, type) => {
     setNotification({ message, type });
     setTimeout(() => setNotification(null), 5000);
@@ -350,21 +365,6 @@ function MainApp() {
       )}
     </div>
   );
-}
-
-// Helper function for downloading JSON
-function handleDownloadJson() {
-  if (!jsonData) return;
-  const blob = new Blob([JSON.stringify(jsonData, null, 2)], {
-    type: "application/json",
-  });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = "detections.json";
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
 }
 
 const styles = {
