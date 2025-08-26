@@ -30,17 +30,33 @@ resnet.fc = torch.nn.Sequential(
     torch.nn.BatchNorm1d(1024),
     torch.nn.ReLU(),
     torch.nn.Dropout(0.5),
-    torch.nn.Linear(1024, 15)
+    torch.nn.Linear(1024, 19)
 )
-checkpoint_path = os.path.join(settings.BASE_DIR, 'classifier', 'models', '15_s.pth')
+checkpoint_path = os.path.join(settings.BASE_DIR, 'classifier', 'models', 'best_model_fold_4.pth')
 checkpoint = torch.load(checkpoint_path, map_location='cpu')
 resnet.load_state_dict(checkpoint['model_state_dict'])
 resnet.eval()
 
 CLASS_NAMES = [
-    'aepyceros melampus', 'bos taurus', 'cephalophus nigrifrons', 'crax rubra', 'dasyprocta punctata',
-    'didelphis pernigra', 'equus quagga', 'leopardus pardalis', 'loxodonta africana', 'madoqua guentheri',
-    'meleagris ocellata', 'mitu tuberosum', 'panthera onca', 'pecari tajacu', 'tayassu pecari'
+    'aepyceros_melampus',
+    'bos_taurus',
+    'capra_aegagrus',
+    'crax_rubra',
+    'dasyprocta_punctata',
+    'duikercommongrey',
+    'equus_quagga',
+    'giraffa_camelopardalis',
+    'kudu',
+    'leopardus_pardalis',
+    'loxodonta_africana',
+    'madoqua_guentheri',
+    'meleagris_ocellata',
+    'mitu_tuberosum',
+    'pecari_tajacu',
+    'psophia_leucoptera',
+    'steenbok',
+    'tayassu_pecari',
+    'zebramountain'
 ]
 
 classification_transform = transforms.Compose([
