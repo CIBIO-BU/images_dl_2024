@@ -71,63 +71,72 @@ function MainApp() {
   };
 
   const handleFeedbackSubmit = async () => {
-  if (!selectedImage || Object.keys(currentFeedback).length === 0) {
-    showNotification("No feedback to submit", "warning");
-    return;
-  }
-
-  try {
-    // Prepare the feedback payload
-    const payload = {
-      image_url: selectedImage,
-      detections: detections[selectedImage].map(det => ({
-        bbox: det.bbox,
-        label: det.label,
-        confidence: det.confidence,
-        index: det.index
-      })),
-      user_feedback: currentFeedback
-    };
-
-    const response = await axios.post(
-      "http://127.0.0.1:8000/api/feedback/",
-      payload,
-      {
-        headers: {
-          "Content-Type": "application/json",
-        }
-      }
-    );
-
-    if (response.data.status === "success") {
-      showNotification("Feedback submitted successfully!", "success");
-      setFeedbackOpen(false);
-      setCurrentFeedback({});
-      
-      // Update local state with the feedback
-      setDetections(prev => {
-        const updated = {...prev};
-        if (updated[selectedImage]) {
-          updated[selectedImage] = updated[selectedImage].map(det => ({
-            ...det,
-            ...currentFeedback[det.index]
-          }));
-        }
-        return updated;
-      });
-    } else {
-      throw new Error(response.data.error || "Failed to save feedback");
+    if (!selectedImage || Object.keys(currentFeedback).length === 0) {
+      showNotification("No feedback to submit", "warning");
+      return;
     }
-  } catch (error) {
-    console.error("Feedback submission error:", error);
-    showNotification(
-      error.response?.data?.error || 
-      error.message || 
-      "Failed to submit feedback",
-      "error"
-    );
-  }
-};
+
+    // Find the image object for the selectedImage
+    const imageObj = images.find(img => img.url === selectedImage);
+    if (!imageObj || !imageObj.file) {
+      showNotification("Image file not found for feedback", "error");
+      return;
+    }
+
+    try {
+      // Prepare FormData for feedback
+      const formData = new FormData();
+      formData.append("file", imageObj.file);
+      formData.append(
+        "detections",
+        JSON.stringify(detections[selectedImage].map(det => ({
+          bbox: det.bbox,
+          label: det.label,
+          confidence: det.confidence,
+          index: det.index
+        })))
+      );
+      formData.append("user_feedback", JSON.stringify(currentFeedback));
+
+      const response = await axios.post(
+        "http://127.0.0.1:8000/api/feedback/",
+        formData,
+        {
+          headers: {
+            "Content-Type": "multipart/form-data",
+          },
+        }
+      );
+
+      if (response.data.status === "success") {
+        showNotification("Feedback submitted successfully!", "success");
+        setFeedbackOpen(false);
+        setCurrentFeedback({});
+
+        // Update local state with the feedback
+        setDetections(prev => {
+          const updated = { ...prev };
+          if (updated[selectedImage]) {
+            updated[selectedImage] = updated[selectedImage].map(det => ({
+              ...det,
+              ...currentFeedback[det.index],
+            }));
+          }
+          return updated;
+        });
+      } else {
+        throw new Error(response.data.error || "Failed to save feedback");
+      }
+    } catch (error) {
+      console.error("Feedback submission error:", error);
+      showNotification(
+        error.response?.data?.error ||
+        error.message ||
+        "Failed to submit feedback",
+        "error"
+      );
+    }
+  };
 
 // Helper function for downloading JSON
 function handleDownloadJson() {

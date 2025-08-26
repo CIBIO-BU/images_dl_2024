@@ -3,7 +3,7 @@ from django.core.validators import URLValidator
 from django.core.exceptions import ValidationError
 
 class Feedback(models.Model):
-    image_url = models.TextField(validators=[URLValidator()])
+    image = models.ImageField(upload_to='feedback_images/')
     original_detections = models.JSONField()
     user_feedback = models.JSONField()
     created_at = models.DateTimeField(auto_now_add=True)
@@ -17,4 +17,4 @@ class Feedback(models.Model):
             raise ValidationError("user_feedback must be a dictionary")
 
     def __str__(self):
-        return f"Feedback #{self.id} for {self.image_url}"
+        return f"Feedback #{self.id} (image: {self.image.name})"

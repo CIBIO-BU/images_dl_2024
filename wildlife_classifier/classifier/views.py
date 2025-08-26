@@ -100,51 +100,46 @@ def feedback(request):
         return JsonResponse({"error": "Only POST method is allowed"}, status=405)
     
     try:
-        # Parse JSON data from request body
+        # For multipart/form-data, get data from request.FILES and request.POST
+        image_file = request.FILES.get("file")
+        detections_json = request.POST.get("detections")
+        user_feedback_json = request.POST.get("user_feedback")
+
+        if not image_file or not detections_json or not user_feedback_json:
+            return JsonResponse({
+                "error": "Missing required fields. Required: file, detections, user_feedback"
+            }, status=400)
+
+        # Parse JSON fields
         try:
-            data = json.loads(request.body)
-        except json.JSONDecodeError:
-            return JsonResponse({"error": "Invalid JSON format"}, status=400)
-        
-        # Validate required fields
-        required_fields = ['image_url', 'detections', 'user_feedback']
-        if not all(field in data for field in required_fields):
-            return JsonResponse(
-                {"error": f"Missing required fields. Required: {required_fields}"},
-                status=400
-            )
-        
-        # Create a temporary file path for blob URLs
-        image_url = data['image_url']
-        if image_url.startswith('blob:'):
-            # Handle blob URLs by storing them as a special marker
-            image_url = f"blob-url:{image_url}"
-        
-        # Create and save feedback
+            detections = json.loads(detections_json)
+            user_feedback = json.loads(user_feedback_json)
+        except Exception as e:
+            return JsonResponse({"error": f"Invalid JSON in fields: {str(e)}"}, status=400)
+
+        # Save image to media/feedback_images/
+        from .models import Feedback
         feedback = Feedback(
-            image_url=image_url,
-            original_detections=data['detections'],
-            user_feedback=data['user_feedback']
+            original_detections=detections,
+            user_feedback=user_feedback
         )
-        
-        # Full clean and validation
+        feedback.image.save(image_file.name, image_file)
         feedback.full_clean()
         feedback.save()
-        
-        # Return success response with created feedback ID
+
         return JsonResponse({
             "status": "success",
             "feedback_id": feedback.id,
             "message": "Feedback saved successfully",
             "created_at": feedback.created_at.isoformat()
         }, status=201)
-        
+
     except ValidationError as e:
         logger.error(f"Validation error: {str(e)}")
         return JsonResponse({"error": str(e)}, status=400)
     except Exception as e:
         logger.exception("Error saving feedback")
-        return JsonResponse({"error": "Internal server error"}, status=500) 
+        return JsonResponse({"error": "Internal server error"}, status=500)
     
 @csrf_exempt
 def get_feedback_samples(request):
