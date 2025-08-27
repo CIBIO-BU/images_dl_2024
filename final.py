@@ -25,18 +25,18 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True  # Handle corrupted images
 def parse_args():
     parser = argparse.ArgumentParser(description='Progressive ResNet50 Wildlife Classification')
     parser.add_argument('--data-dir', type=str, default='wcs_cropped_download', help='Path to dataset directory')
-    parser.add_argument('--epochs-per-subset', type=int, default=15, help='Epochs per subset')
+    parser.add_argument('--epochs-per-subset', type=int, default=10, help='Epochs per subset')
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size for training')
     parser.add_argument('--lr', type=float, default=0.0001, help='Initial learning rate')
     parser.add_argument('--min-samples', type=int, default=5000, help='Minimum samples per class')
     parser.add_argument('--num-subsets', type=int, default=1, help='Number of data subsets (groups)')
     parser.add_argument('--num-workers', type=int, default=1, help='Number of data loader workers')
-    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints_cv', help='Directory to save checkpoints')
-    parser.add_argument('--early-stopping', type=int, default=10, help='Patience for early stopping')
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints_cv_4_backbones', help='Directory to save checkpoints')
+    parser.add_argument('--early-stopping', type=int, default=7, help='Patience for early stopping')
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay for optimizer')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate')
     parser.add_argument('--test-split', type=float, default=0.1, help='Fraction of data to use as test set')
-    parser.add_argument('--cv-folds', type=int, default=10, help='If >0, run classical stratified k-fold cross-validation with this many folds (disables progressive subsets).')
+    parser.add_argument('--cv-folds', type=int, default=1, help='If >0, run classical stratified k-fold cross-validation with this many folds (disables progressive subsets).')
 
     return parser.parse_args()
 
@@ -99,26 +99,50 @@ def get_class_distribution(dataset):
     else:
         raise ValueError("Unsupported dataset type")
 
-def setup_model(num_classes, device, subset_group=1):
-    """Initialize and configure ResNet50 model with proper unfreezing"""
-    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
-    
-    # Classifier head (always trainable)
-    model.fc = nn.Sequential(
-        nn.Linear(model.fc.in_features, 1024),
+def setup_model(num_classes, device, subset_group=1, backbone='resnet50'):
+    """Initialize backbone + 2-layer head; keeps your exact head."""
+    if backbone == 'resnet50':
+        base = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+        in_feats = base.fc.in_features
+        base.fc = nn.Identity()
+    elif backbone == 'convnext_tiny':
+        base = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
+        in_feats = base.classifier[2].in_features
+        base.classifier[2] = nn.Identity()
+    elif backbone == 'vit_b_16':
+        base = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
+        in_feats = base.heads.head.in_features
+        base.heads.head = nn.Identity()
+    elif backbone == 'mobilenet_v3_large':
+        base = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.IMAGENET1K_V2)
+        in_feats = base.classifier[3].in_features
+        base.classifier[3] = nn.Identity()
+    else:
+        raise ValueError(f"Unknown backbone '{backbone}'")
+
+    classifier = nn.Sequential(
+        nn.Linear(in_feats, 1024),
         nn.BatchNorm1d(1024),
         nn.ReLU(),
         nn.Dropout(0.5),
         nn.Linear(1024, num_classes)
     )
-    
-    # First freeze all parameters
-    for param in model.parameters():
-        param.requires_grad = True
-    
-    model = model.to(device)
-    trainable_params = sum(p.numel() for p in model.parameters())
-    print(f"🔧 Model setup: Group {subset_group}, Trainable params: {trainable_params:,}")
+
+    class Net(nn.Module):
+        def __init__(self, feature, classifier):
+            super().__init__()
+            self.feature = feature
+            self.classifier = classifier
+        def forward(self, x):
+            x = self.feature(x)
+            # CNNs return (N,C,H,W); ViT returns (N,D)
+            if x.ndim == 4:
+                x = torch.flatten(nn.functional.adaptive_avg_pool2d(x, 1), 1)
+            return self.classifier(x)
+
+    model = Net(base, classifier).to(device)
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"🔧 Model setup: Group {subset_group}, Backbone={backbone}, Trainable params: {trainable_params:,}")
     return model
 
 def load_checkpoint(model, checkpoint_path, device):
@@ -330,7 +354,7 @@ def get_weighted_sampler(dataset):
     
     return WeightedRandomSampler(sample_weights, len(sample_weights))
 
-def train_on_subsets(args, model, full_dataset, device, test_loader=None):
+def train_on_subsets(args, backbone_name, full_dataset, device, test_loader=None):
     """Main training loop with 4 subsets (groups)"""
     subsets = create_subsets(full_dataset, args.num_subsets)
     validate_subsets(subsets, full_dataset)
@@ -346,7 +370,7 @@ def train_on_subsets(args, model, full_dataset, device, test_loader=None):
         print(f"📊 Class distribution: {get_class_distribution(subsets[subset_idx])}")
         
         # Setup model with correct unfreezing
-        model = setup_model(len(class_names), device, subset_group)
+        model = setup_model(len(class_names), device, subset_group, backbone=backbone_name)
         
         # Load checkpoint if continuing training
         if subset_idx > 0:
@@ -485,7 +509,7 @@ def train_on_subsets(args, model, full_dataset, device, test_loader=None):
     
     return history, model
 
-def train_with_cross_validation(args, model, full_dataset, device, test_loader=None):
+def train_with_cross_validation(args, backbone_name, full_dataset, device, test_loader=None):
     """
     Stratified K-Fold cross-validation training.
     Uses the same train/eval pipeline as subsets, but per-fold.
@@ -510,7 +534,7 @@ def train_with_cross_validation(args, model, full_dataset, device, test_loader=N
         print(f"📊 Train size: {len(train_idx)} | Val size: {len(val_idx)}")
 
         # Fresh model each fold (transfer learning init)
-        model = setup_model(num_classes=len(class_names), device=device, subset_group=1)
+        model = setup_model(num_classes=len(class_names), device=device, subset_group=1, backbone=backbone_name)
 
         # Transforms (reuse your originals)
         train_transform = transforms.Compose([
@@ -629,7 +653,7 @@ def train_with_cross_validation(args, model, full_dataset, device, test_loader=N
             best_model_state = model.state_dict().copy()
 
     # Load the best fold state into a fresh model to return
-    best_model = setup_model(num_classes=len(class_names), device=device, subset_group=1)
+    best_model = setup_model(num_classes=len(class_names), device=device, subset_group=1, backbone=backbone_name)
     if best_model_state is not None:
         best_model.load_state_dict(best_model_state, strict=False)
         print(f"\n🏅 Best fold: {best_fold_id+1} with Val Acc = {best_overall_acc:.2%}")
@@ -846,33 +870,46 @@ def save_plots(history, class_names, checkpoint_dir, test_results=None):
     plt.close()
 
 def main():
+    # -------------------------
+    # 0) Config & device
+    # -------------------------
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 Using device: {device}")
-    
-    # Load and filter dataset
+
+    # Backbones to run sequentially (no CLI flags needed)
+    BACKBONES_TO_RUN = [
+        "resnet50",
+        "convnext_tiny",
+        "vit_b_16",
+        # "mobilenet_v3_large",  # optional: uncomment to include
+    ]
+
+    # -------------------------
+    # 1) Load and filter dataset
+    # -------------------------
     print("📦 Loading data...")
     full_dataset = datasets.ImageFolder(args.data_dir)
-    
+
     # Filter classes with insufficient samples
+    from collections import defaultdict
     class_counts = defaultdict(int)
     for _, label in full_dataset.samples:
         class_counts[label] += 1
-    
-    valid_classes = []
-    excluded_classes = []
+
+    valid_classes, excluded_classes = [], []
     for cls, idx in full_dataset.class_to_idx.items():
         if class_counts.get(idx, 0) >= args.min_samples:
             valid_classes.append(cls)
         else:
             excluded_classes.append(cls)
-    
+
     print(f"\n📊 Original class count: {len(full_dataset.classes)}")
     print(f"🚫 Excluded {len(excluded_classes)} classes with < {args.min_samples} samples:")
     print(excluded_classes)
     print(f"✅ Using {len(valid_classes)} valid classes")
-    
-    # Filter the dataset to only include valid classes
+
+    # Remap samples to only include valid classes
     valid_class_indices = [full_dataset.class_to_idx[cls] for cls in valid_classes]
     filtered_samples = [
         (path, valid_class_indices.index(label))
@@ -880,15 +917,16 @@ def main():
         if label in valid_class_indices
     ]
 
-    # Create filtered dataset
+    # Build filtered datasets
     filtered_dataset = datasets.ImageFolder(args.data_dir)
     filtered_dataset.samples = filtered_samples
     filtered_dataset.targets = [s[1] for s in filtered_samples]
     filtered_dataset.classes = valid_classes
     filtered_dataset.class_to_idx = {cls: i for i, cls in enumerate(valid_classes)}
     print("📊 Filtered class distribution:", json.dumps(get_class_distribution(filtered_dataset), indent=2))
-    
-    # Now split the FILTERED dataset into train+val and test
+
+    # Split train+val vs test (unchanged)
+    from sklearn.model_selection import train_test_split
     trainval_idx, test_idx = train_test_split(
         list(range(len(filtered_samples))),
         test_size=args.test_split,
@@ -913,70 +951,91 @@ def main():
     print(f"\n📊 Final train+val size: {len(trainval_dataset)} samples")
     print(f"🧪 Test set size: {len(test_dataset)} samples")
     print("📊 Test set distribution:", json.dumps(get_class_distribution(test_dataset), indent=2))
-    
-    # Create test loader
+
+    # Test transform/loader (unchanged)
     test_transform = transforms.Compose([
         transforms.Resize(448),
         transforms.CenterCrop(384),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
-    test_dataset.transform = test_transform  # Directly set transform on test_dataset
+    test_dataset.transform = test_transform
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=min(2, args.num_workers)
     )
-    
-    # Initialize model
-    print("🧠 Initializing model...")
-    model = setup_model(len(trainval_dataset.classes), device, subset_group=1)
 
-    # Create checkpoint directory
+    # -------------------------
+    # 2) Run ALL backbones sequentially
+    # -------------------------
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+    all_runs = []
 
-    # === Choose training mode ===
-    if args.cv_folds and args.cv_folds > 0:
-        print(f"\n🔁 Running stratified {args.cv_folds}-fold cross-validation...")
-        history, trained_model = train_with_cross_validation(args, model, trainval_dataset, device, test_loader)
-    else:
-        print("\n🌀 Running progressive subset training...")
-        history, trained_model = train_on_subsets(args, model, trainval_dataset, device, test_loader)
+    for backbone in BACKBONES_TO_RUN:
+        print(f"\n================  Running backbone: {backbone}  ================\n")
 
-    # Final evaluation on test set
-    print("\n🏆 Final evaluation on test set...")
-    test_results = evaluate(
-        trained_model, test_loader, trainval_dataset.classes, nn.CrossEntropyLoss(), device
-    )
-    
-    print("\n📊 Test Set Metrics:")
-    print(f"Accuracy: {test_results['accuracy']:.2%}")
-    print(f"Top-5 Accuracy: {test_results['top5_accuracy']:.2%}")
-    print(f"mAP: {test_results['mAP']:.2%}")
-    print(f"AUROC: {test_results['AUROC']:.2%}")
-    
-    # Save results
-    print("\n💾 Saving results...")
-    with open(os.path.join(args.checkpoint_dir, 'training_history.json'), 'w') as f:
-        json.dump(history, f)
-    
-    # Generate plots
-    if len(history) > 0:
-        save_plots(history, trainval_dataset.classes, args.checkpoint_dir, test_results)
-        print(f"📊 Saved training plots to {args.checkpoint_dir}/plots/")
-    
-    with open(os.path.join(args.checkpoint_dir, 'test_results.json'), 'w') as f:
-        json.dump(convert(test_results), f, indent=2)
+        # Per-backbone subdir to keep artifacts tidy
+        run_dir = os.path.join(args.checkpoint_dir, backbone)
+        os.makedirs(run_dir, exist_ok=True)
 
-    # Save final model
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'class_names': trainval_dataset.classes,
-        'test_metrics': test_results
-    }, os.path.join(args.checkpoint_dir, 'final_model.pth'))
-    
-    print("\n🎉 Training complete!")
+        # Train on your progressive subsets (uses your existing logic)
+        history, trained_model = train_with_cross_validation(
+            args=args,
+            backbone_name=backbone,            # <-- requires tiny signature change in train_on_subsets
+            full_dataset=trainval_dataset,
+            device=device,
+            test_loader=test_loader
+        )
+
+        # Final evaluation on test set (unchanged)
+        print("\n🏆 Final evaluation on test set...")
+        test_results = evaluate(
+            trained_model, test_loader, trainval_dataset.classes, nn.CrossEntropyLoss(), device
+        )
+
+        # Save per-backbone artifacts (same as you already do, but under run_dir)
+        print("\n💾 Saving results...")
+        with open(os.path.join(run_dir, 'training_history.json'), 'w') as f:
+            json.dump(history, f)
+        with open(os.path.join(run_dir, 'test_results.json'), 'w') as f:
+            json.dump(convert(test_results), f, indent=2)
+
+        torch.save({
+            'model_state_dict': trained_model.state_dict(),
+            'class_names': trainval_dataset.classes,
+            'test_metrics': test_results
+        }, os.path.join(run_dir, 'final_model.pth'))
+
+        # Plots (your existing function)
+        if len(history) > 0:
+            save_plots(history, trainval_dataset.classes, run_dir, test_results)
+            print(f"📊 Saved training plots to {run_dir}/plots/")
+
+        # Collect summary row
+        all_runs.append({
+            'backbone': backbone,
+            'accuracy': test_results['accuracy'],
+            'top5_accuracy': test_results['top5_accuracy'],
+            'mAP': test_results['mAP'],
+            'AUROC': test_results['AUROC'],
+            'ECE': test_results['confidence_metrics']['calibration']['ece'],
+        })
+
+        # Free VRAM between runs
+        del trained_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # -------------------------
+    # 3) Cross-backbone summary
+    # -------------------------
+    summary_df = pd.DataFrame(all_runs)
+    summary_csv = os.path.join(args.checkpoint_dir, 'summary_by_backbone.csv')
+    summary_df.to_csv(summary_csv, index=False)
+    print(f"\n✅ Wrote backbone summary to {summary_csv}\n")
+    print(summary_df)
 
 if __name__ == "__main__":
     torch.multiprocessing.set_sharing_strategy('file_system')

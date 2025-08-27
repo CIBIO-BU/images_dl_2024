@@ -30,9 +30,9 @@ resnet.fc = torch.nn.Sequential(
     torch.nn.BatchNorm1d(1024),
     torch.nn.ReLU(),
     torch.nn.Dropout(0.5),
-    torch.nn.Linear(1024, 19)
+    torch.nn.Linear(1024, 15)
 )
-checkpoint_path = os.path.join(settings.BASE_DIR, 'classifier', 'models', 'best_model_fold_4.pth')
+checkpoint_path = os.path.join(settings.BASE_DIR, 'classifier', 'models', 'cv_best_model_fold_4.pth')
 checkpoint = torch.load(checkpoint_path, map_location='cpu')
 resnet.load_state_dict(checkpoint['model_state_dict'])
 resnet.eval()
@@ -43,10 +43,8 @@ CLASS_NAMES = [
     'capra_aegagrus',
     'crax_rubra',
     'dasyprocta_punctata',
-    'duikercommongrey',
     'equus_quagga',
     'giraffa_camelopardalis',
-    'kudu',
     'leopardus_pardalis',
     'loxodonta_africana',
     'madoqua_guentheri',
@@ -54,9 +52,7 @@ CLASS_NAMES = [
     'mitu_tuberosum',
     'pecari_tajacu',
     'psophia_leucoptera',
-    'steenbok',
-    'tayassu_pecari',
-    'zebramountain'
+    'tayassu_pecari'
 ]
 
 classification_transform = transforms.Compose([
