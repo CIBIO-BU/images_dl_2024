@@ -25,14 +25,14 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True  # Handle corrupted images
 def parse_args():
     parser = argparse.ArgumentParser(description='Progressive ResNet50 Wildlife Classification')
     parser.add_argument('--data-dir', type=str, default='wcs_cropped_download', help='Path to dataset directory')
-    parser.add_argument('--epochs-per-subset', type=int, default=10, help='Epochs per subset')
+    parser.add_argument('--epochs-per-subset', type=int, default=15, help='Epochs per subset')
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size for training')
     parser.add_argument('--lr', type=float, default=0.0001, help='Initial learning rate')
     parser.add_argument('--min-samples', type=int, default=5000, help='Minimum samples per class')
-    parser.add_argument('--num-subsets', type=int, default=1, help='Number of data subsets (groups)')
+    parser.add_argument('--num-subsets', type=int, default=20, help='Number of data subsets (groups)')
     parser.add_argument('--num-workers', type=int, default=1, help='Number of data loader workers')
-    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints_cv_4_backbones', help='Directory to save checkpoints')
-    parser.add_argument('--early-stopping', type=int, default=7, help='Patience for early stopping')
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints_cv_tos_384', help='Directory to save checkpoints')
+    parser.add_argument('--early-stopping', type=int, default=15, help='Patience for early stopping')
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay for optimizer')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate')
     parser.add_argument('--test-split', type=float, default=0.1, help='Fraction of data to use as test set')
@@ -387,7 +387,7 @@ def train_on_subsets(args, backbone_name, full_dataset, device, test_loader=None
         
         # Training transforms with augmentation
         train_transform = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
+            transforms.RandomResizedCrop(384, scale=(0.6, 1.0)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
             transforms.RandomRotation(30),
@@ -413,7 +413,7 @@ def train_on_subsets(args, backbone_name, full_dataset, device, test_loader=None
         # Validation transforms
         val_transform = transforms.Compose([
             transforms.Resize(448),
-            transforms.CenterCrop(224),
+            transforms.CenterCrop(384),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
@@ -525,7 +525,7 @@ def train_with_cross_validation(args, backbone_name, full_dataset, device, test_
 
     # Define transforms once
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
+        transforms.RandomResizedCrop(384, scale=(0.6, 1.0)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
         transforms.RandomRotation(30),
@@ -537,7 +537,7 @@ def train_with_cross_validation(args, backbone_name, full_dataset, device, test_
     
     val_transform = transforms.Compose([
         transforms.Resize(448),
-        transforms.CenterCrop(224),
+        transforms.CenterCrop(384),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
@@ -886,9 +886,9 @@ def main():
     # Backbones to run sequentially (no CLI flags needed)
     BACKBONES_TO_RUN = [
         "resnet50",
-        "convnext_tiny",
-        "vit_b_16",
-        "mobilenet_v3_large",  # optional: uncomment to include
+        #"convnext_tiny",
+        #"vit_b_16",
+        #"mobilenet_v3_large",  # optional: uncomment to include
     ]
 
     # -------------------------
@@ -961,7 +961,7 @@ def main():
     # Test transform/loader (unchanged)
     test_transform = transforms.Compose([
         transforms.Resize(448),
-        transforms.CenterCrop(224),
+        transforms.CenterCrop(384),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
@@ -987,7 +987,7 @@ def main():
         os.makedirs(run_dir, exist_ok=True)
 
         # Train on your progressive subsets (uses your existing logic)
-        history, trained_model = train_with_cross_validation(
+        history, trained_model = train_on_subsets(
             args=args,
             backbone_name=backbone,            # <-- requires tiny signature change in train_on_subsets
             full_dataset=trainval_dataset,
