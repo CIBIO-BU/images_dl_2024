@@ -36,8 +36,7 @@ def parse_args():
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay for optimizer')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate')
     parser.add_argument('--test-split', type=float, default=0.1, help='Fraction of data to use as test set')
-    parser.add_argument('--cv-folds', type=int, default=1, help='If >0, run classical stratified k-fold cross-validation with this many folds (disables progressive subsets).')
-
+    parser.add_argument('--cv-folds', type=int, default=2, help='If >0, run classical stratified k-fold cross-validation with this many folds')
     return parser.parse_args()
 
 def convert(obj):
@@ -388,7 +387,7 @@ def train_on_subsets(args, backbone_name, full_dataset, device, test_loader=None
         
         # Training transforms with augmentation
         train_transform = transforms.Compose([
-            transforms.RandomResizedCrop(384, scale=(0.6, 1.0)),
+            transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
             transforms.RandomRotation(30),
@@ -414,7 +413,7 @@ def train_on_subsets(args, backbone_name, full_dataset, device, test_loader=None
         # Validation transforms
         val_transform = transforms.Compose([
             transforms.Resize(448),
-            transforms.CenterCrop(384),
+            transforms.CenterCrop(224),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
@@ -509,16 +508,11 @@ def train_on_subsets(args, backbone_name, full_dataset, device, test_loader=None
     
     return history, model
 
+
 def train_with_cross_validation(args, backbone_name, full_dataset, device, test_loader=None):
     """
     Stratified K-Fold cross-validation training.
-    Uses the same train/eval pipeline as subsets, but per-fold.
-    - Resets the model at the start of each fold (transfer learning from ImageNet each time).
-    - Early-stopping and ReduceLROnPlateau per fold.
-    - Saves best checkpoint per fold to args.checkpoint_dir/best_model_fold_{k}.pth
-    Returns:
-        history: list of per-epoch records (compatible with save_plots)
-        best_model: the model state dict of the best fold by val accuracy
+    Fixed to ensure validation data is completely separate from training data.
     """
     skf = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=42)
     labels = [lbl for _, lbl in full_dataset.samples]
@@ -529,47 +523,59 @@ def train_with_cross_validation(args, backbone_name, full_dataset, device, test_
     best_model_state = None
     best_fold_id = None
 
+    # Define transforms once
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(30),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
+        transforms.RandomAffine(degrees=15, translate=(0.2, 0.2)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    
+    val_transform = transforms.Compose([
+        transforms.Resize(448),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
     for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(labels)), labels)):
         print(f"\n🧩 Fold {fold+1}/{args.cv_folds}")
         print(f"📊 Train size: {len(train_idx)} | Val size: {len(val_idx)}")
+        
+        # Create SEPARATE dataset copies for train and val
+        train_dataset = datasets.ImageFolder(args.data_dir)
+        train_dataset.samples = [full_dataset.samples[i] for i in train_idx]
+        train_dataset.targets = [s[1] for s in train_dataset.samples]
+        train_dataset.classes = class_names
+        train_dataset.class_to_idx = full_dataset.class_to_idx
+        train_dataset.transform = train_transform
+        
+        val_dataset = datasets.ImageFolder(args.data_dir)
+        val_dataset.samples = [full_dataset.samples[i] for i in val_idx]
+        val_dataset.targets = [s[1] for s in val_dataset.samples]
+        val_dataset.classes = class_names
+        val_dataset.class_to_idx = full_dataset.class_to_idx
+        val_dataset.transform = val_transform
 
-        # Fresh model each fold (transfer learning init)
+        # Fresh model each fold
         model = setup_model(num_classes=len(class_names), device=device, subset_group=1, backbone=backbone_name)
 
-        # Transforms (reuse your originals)
-        train_transform = transforms.Compose([
-            transforms.RandomResizedCrop(384, scale=(0.6, 1.0)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
-            transforms.RandomRotation(30),
-            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
-            transforms.RandomAffine(degrees=15, translate=(0.2, 0.2)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
-        val_transform = transforms.Compose([
-            transforms.Resize(448),
-            transforms.CenterCrop(384),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        ])
-
-        # Datasets + loaders for this fold
-        full_dataset.transform = train_transform
-        train_subset = Subset(full_dataset, train_idx)
-        sampler = get_weighted_sampler(train_subset)
+        # Create loaders with separate datasets
+        sampler = get_weighted_sampler(train_dataset)
         train_loader = DataLoader(
-            train_subset,
+            train_dataset,
             batch_size=args.batch_size,
             sampler=sampler,
             num_workers=args.num_workers,
             pin_memory=torch.cuda.is_available(),
             persistent_workers=args.num_workers > 0
         )
-
-        full_dataset.transform = val_transform
         val_loader = DataLoader(
-            Subset(full_dataset, val_idx),
+            val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=min(2, args.num_workers),
@@ -882,7 +888,7 @@ def main():
         "resnet50",
         "convnext_tiny",
         "vit_b_16",
-        # "mobilenet_v3_large",  # optional: uncomment to include
+        "mobilenet_v3_large",  # optional: uncomment to include
     ]
 
     # -------------------------
@@ -955,7 +961,7 @@ def main():
     # Test transform/loader (unchanged)
     test_transform = transforms.Compose([
         transforms.Resize(448),
-        transforms.CenterCrop(384),
+        transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])

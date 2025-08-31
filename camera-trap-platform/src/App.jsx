@@ -41,24 +41,29 @@ function MainApp() {
           }
         );
 
-        const mappedDetections = response.data.detections.map((det) => ({
+        const mappedDetections = response.data.detections.map((det, i) => ({
           label: det.species_prediction,
           confidence: det.species_confidence,
           bbox: det.bbox,
-          index: det.index || response.data.detections.indexOf(det),
+          index: i,
         }));
 
         const fileUrl = URL.createObjectURL(file);
+
+        // 1) Keep url for display, but use file.name as the KEY
         newImages.push({ file, url: fileUrl, name: file.name });
-        newDetections[fileUrl] = mappedDetections;
+
+        // 2) Key detections by the filename
+        newDetections[file.name] = mappedDetections;
       }
 
-      setImages((prevImages) => [...prevImages, ...newImages]);
-      setDetections((prevDetections) => ({ ...prevDetections, ...newDetections }));
-      setJsonData((prevJson) => ({ ...prevJson, ...newDetections }));
+      setImages(prev => [...prev, ...newImages]);
+      setDetections(prev => ({ ...prev, ...newDetections }));
+      setJsonData(prev => ({ ...prev, ...newDetections }));
 
       if (newImages.length > 0) {
-        setSelectedImage(newImages[0].url);
+        // select by filename (the new key)
+        setSelectedImage(newImages[0].name);
       }
 
       showNotification("Images processed successfully!", "success");
@@ -77,7 +82,7 @@ function MainApp() {
     }
 
     // Find the image object for the selectedImage
-    const imageObj = images.find(img => img.url === selectedImage);
+    const imageObj = images.find(img => img.name === selectedImage);
     if (!imageObj || !imageObj.file) {
       showNotification("Image file not found for feedback", "error");
       return;
@@ -224,37 +229,45 @@ function handleDownloadJson() {
       <div style={styles.displayArea}>
         {selectedImage && (
           <div style={styles.imageContainer}>
-            <img
-              src={selectedImage}
-              alt="Selected"
-              style={styles.image}
-              onLoad={(e) => {
-                const { width, height } = e.target;
-                setImageSize({ width, height });
-              }}
-            />
-            {detections[selectedImage]?.map((detection, idx) => {
-              const [x_min, y_min, x_max, y_max] = detection.bbox;
-              const boxWidth = x_max - x_min;
-              const boxHeight = y_max - y_min;
-
+            {(() => {
+              const imgObj = images.find(i => i.name === selectedImage);
+              if (!imgObj) return null;
               return (
-                <div
-                  key={idx}
-                  style={{
-                    ...styles.detectionBox,
-                    left: `${(x_min / imageSize.width) * 100}%`,
-                    top: `${(y_min / imageSize.height) * 100}%`,
-                    width: `${(boxWidth / imageSize.width) * 100}%`,
-                    height: `${(boxHeight / imageSize.height) * 100}%`,
-                  }}
-                >
-                  <span style={styles.detectionLabel}>
-                    {detection.label} ({Math.round(detection.confidence * 100)}%)
-                  </span>
-                </div>
+                <>
+                  <img
+                    src={imgObj.url}
+                    alt="Selected"
+                    style={styles.image}
+                    onLoad={(e) => {
+                      const { width, height } = e.target;
+                      setImageSize({ width, height });
+                    }}
+                  />
+                  {detections[selectedImage]?.map((detection, idx) => {
+                    const [x_min, y_min, x_max, y_max] = detection.bbox;
+                    const boxWidth = x_max - x_min;
+                    const boxHeight = y_max - y_min;
+
+                    return (
+                      <div
+                        key={idx}
+                        style={{
+                          ...styles.detectionBox,
+                          left: `${(x_min / imageSize.width) * 100}%`,
+                          top: `${(y_min / imageSize.height) * 100}%`,
+                          width: `${(boxWidth / imageSize.width) * 100}%`,
+                          height: `${(boxHeight / imageSize.height) * 100}%`,
+                        }}
+                      >
+                        <span style={styles.detectionLabel}>
+                          {detection.label} ({Math.round(detection.confidence * 100)}%)
+                        </span>
+                      </div>
+                    );
+                  })}
+                </>
               );
-            })}
+            })()}
           </div>
         )}
       </div>
@@ -265,17 +278,21 @@ function handleDownloadJson() {
             key={index}
             style={{
               ...styles.thumbnail,
-              border: selectedImage === image.url ? "3px solid #1e90ff" : 
-                     detections[image.url]?.length > 0 ? "2px solid #1e90ff" : "2px solid #ff4757",
+              border:
+                selectedImage === image.name
+                  ? "3px solid #1e90ff"
+                  : detections[image.name]?.length > 0
+                  ? "2px solid #1e90ff"
+                  : "2px solid #ff4757",
             }}
-            onClick={() => setSelectedImage(image.url)}
+            onClick={() => setSelectedImage(image.name)}
           >
             <img
               src={image.url}
               alt={`Thumbnail ${index}`}
               style={styles.thumbnailImage}
             />
-            {detections[image.url]?.length === 0 && (
+            {detections[image.name]?.length === 0 && (
               <div style={styles.noAnimalsLabel}>No Animals</div>
             )}
           </div>
