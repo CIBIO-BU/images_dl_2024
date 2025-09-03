@@ -1,18 +1,173 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef, useMemo, useLayoutEffect } from "react";
 import axios from "axios";
 
-// Main App Component with Router
+// ---------- ImageStage: scales + clamps boxes to rendered image, shows labels ----------
+/**
+ * Expects detections as objects:
+ *   { bbox: [x_min, y_min, x_max, y_max], label: string, confidence: number }
+ * BBoxes are in NATURAL image coordinates. We scale+clamp to the rendered image
+ * and render a label (animal + confidence) inside each box.
+ */
+function ImageStage({ src, detections, fitMode = "contain", stageHeight = 500 }) {
+  const containerRef = useRef(null);
+  const imgRef = useRef(null);
+
+  const [natural, setNatural] = useState({ w: 0, h: 0 });
+  const [rendered, setRendered] = useState({ w: 0, h: 0, offsetX: 0, offsetY: 0 });
+
+  const updateRenderedGeometry = () => {
+    const el = containerRef.current;
+    if (!el || !natural.w || !natural.h) return;
+
+    const cw = el.clientWidth;
+    const ch = el.clientHeight;
+    const iw = natural.w;
+    const ih = natural.h;
+
+    const scaleContain = Math.min(cw / iw, ch / ih);
+    const scaleCover = Math.max(cw / iw, ch / ih);
+    const scale = fitMode === "cover" ? scaleCover : scaleContain;
+
+    const w = Math.round(iw * scale);
+    const h = Math.round(ih * scale);
+    const offsetX = Math.round((cw - w) / 2);
+    const offsetY = Math.round((ch - h) / 2);
+
+    setRendered({ w, h, offsetX, offsetY });
+  };
+
+  const handleImgLoad = (e) => {
+    const { naturalWidth, naturalHeight } = e.target;
+    setNatural({ w: naturalWidth, h: naturalHeight });
+    updateRenderedGeometry();
+  };
+
+  useLayoutEffect(() => {
+    if (!containerRef.current) return;
+    const ro = new ResizeObserver(() => updateRenderedGeometry());
+    ro.observe(containerRef.current);
+    return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [natural.w, natural.h, fitMode]);
+
+  const scaledBoxes = useMemo(() => {
+    if (!natural.w || !natural.h || !rendered.w || !rendered.h) return [];
+    const sx = rendered.w / natural.w;
+    const sy = rendered.h / natural.h;
+
+    return (detections || []).map((det, idx) => {
+      const [xMin, yMin, xMax, yMax] = det.bbox;
+      // scale
+      let x = Math.round(xMin * sx);
+      let y = Math.round(yMin * sy);
+      let w = Math.round((xMax - xMin) * sx);
+      let h = Math.round((yMax - yMin) * sy);
+
+      // clamp within rendered image rect
+      x = Math.max(0, Math.min(x, rendered.w));
+      y = Math.max(0, Math.min(y, rendered.h));
+      w = Math.max(0, Math.min(w, rendered.w - x));
+      h = Math.max(0, Math.min(h, rendered.h - y));
+
+      return {
+        id: det.index ?? idx,
+        left: rendered.offsetX + x,
+        top: rendered.offsetY + y,
+        width: w,
+        height: h,
+        label: det.label,
+        confidence: det.confidence,
+      };
+    });
+  }, [detections, natural, rendered]);
+
+  return (
+    <div
+      ref={containerRef}
+      style={{
+        position: "relative",
+        width: "100%",
+        height: stageHeight,
+        overflow: "hidden", // guarantees no visual overflow
+        borderRadius: "10px",
+      }}
+    >
+      <img
+        ref={imgRef}
+        src={src}
+        alt=""
+        onLoad={handleImgLoad}
+        draggable={false}
+        style={{
+          position: "absolute",
+          left: rendered.offsetX,
+          top: rendered.offsetY,
+          width: rendered.w,
+          height: rendered.h,
+          objectFit: fitMode,
+          userSelect: "none",
+          pointerEvents: "none",
+          borderRadius: "8px",
+          boxShadow: "0 4px 12px rgba(0, 0, 0, 0.15)",
+        }}
+      />
+
+      {scaledBoxes.map((b) => (
+        <div
+          key={b.id}
+          style={{
+            position: "absolute",
+            left: b.left,
+            top: b.top,
+            width: b.width,
+            height: b.height,
+            border: "2px solid #00B894",
+            borderRadius: 4,
+            background: "rgba(0, 184, 148, 0.15)",
+            boxSizing: "border-box",
+            pointerEvents: "none",
+          }}
+        >
+          {/* Label INSIDE the box to avoid overflow past image */}
+          <div
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              background: "#00B894",
+              color: "#fff",
+              padding: "2px 6px",
+              fontSize: 12,
+              fontWeight: 700,
+              borderTopLeftRadius: 4,
+              borderBottomRightRadius: 4,
+              lineHeight: 1.2,
+              maxWidth: "100%",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+            title={`${b.label} (${Math.round((b.confidence ?? 0) * 100)}%)`}
+          >
+            {b.label} ({Math.round((b.confidence ?? 0) * 100)}%)
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ---------- Main App Component with Router ----------
 function App() {
   return <MainApp />;
 }
 
-// Main Application Component
+// ---------- Main Application Component ----------
 function MainApp() {
   const [images, setImages] = useState([]);
   const [selectedImage, setSelectedImage] = useState(null);
   const [detections, setDetections] = useState({});
   const [isLoading, setIsLoading] = useState(false);
-  const [imageSize, setImageSize] = useState({ width: 0, height: 0 });
   const [jsonData, setJsonData] = useState(null);
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [currentFeedback, setCurrentFeedback] = useState({});
@@ -34,9 +189,9 @@ function MainApp() {
           "http://127.0.0.1:8000/api/predict/",
           formData,
           {
-            headers: { 
+            headers: {
               "Content-Type": "multipart/form-data",
-              "Authorization": `Bearer ${localStorage.getItem("token")}`
+              Authorization: `Bearer ${localStorage.getItem("token")}`,
             },
           }
         );
@@ -44,25 +199,20 @@ function MainApp() {
         const mappedDetections = response.data.detections.map((det, i) => ({
           label: det.species_prediction,
           confidence: det.species_confidence,
-          bbox: det.bbox,
+          bbox: det.bbox, // [x_min, y_min, x_max, y_max] in NATURAL pixels
           index: i,
         }));
 
         const fileUrl = URL.createObjectURL(file);
-
-        // 1) Keep url for display, but use file.name as the KEY
         newImages.push({ file, url: fileUrl, name: file.name });
-
-        // 2) Key detections by the filename
         newDetections[file.name] = mappedDetections;
       }
 
-      setImages(prev => [...prev, ...newImages]);
-      setDetections(prev => ({ ...prev, ...newDetections }));
-      setJsonData(prev => ({ ...prev, ...newDetections }));
+      setImages((prev) => [...prev, ...newImages]);
+      setDetections((prev) => ({ ...prev, ...newDetections }));
+      setJsonData((prev) => ({ ...prev, ...newDetections }));
 
       if (newImages.length > 0) {
-        // select by filename (the new key)
         setSelectedImage(newImages[0].name);
       }
 
@@ -81,25 +231,25 @@ function MainApp() {
       return;
     }
 
-    // Find the image object for the selectedImage
-    const imageObj = images.find(img => img.name === selectedImage);
+    const imageObj = images.find((img) => img.name === selectedImage);
     if (!imageObj || !imageObj.file) {
       showNotification("Image file not found for feedback", "error");
       return;
     }
 
     try {
-      // Prepare FormData for feedback
       const formData = new FormData();
       formData.append("file", imageObj.file);
       formData.append(
         "detections",
-        JSON.stringify(detections[selectedImage].map(det => ({
-          bbox: det.bbox,
-          label: det.label,
-          confidence: det.confidence,
-          index: det.index
-        })))
+        JSON.stringify(
+          detections[selectedImage].map((det) => ({
+            bbox: det.bbox,
+            label: det.label,
+            confidence: det.confidence,
+            index: det.index,
+          }))
+        )
       );
       formData.append("user_feedback", JSON.stringify(currentFeedback));
 
@@ -118,11 +268,10 @@ function MainApp() {
         setFeedbackOpen(false);
         setCurrentFeedback({});
 
-        // Update local state with the feedback
-        setDetections(prev => {
+        setDetections((prev) => {
           const updated = { ...prev };
           if (updated[selectedImage]) {
-            updated[selectedImage] = updated[selectedImage].map(det => ({
+            updated[selectedImage] = updated[selectedImage].map((det) => ({
               ...det,
               ...currentFeedback[det.index],
             }));
@@ -135,28 +284,26 @@ function MainApp() {
     } catch (error) {
       console.error("Feedback submission error:", error);
       showNotification(
-        error.response?.data?.error ||
-        error.message ||
-        "Failed to submit feedback",
+        error.response?.data?.error || error.message || "Failed to submit feedback",
         "error"
       );
     }
   };
 
-// Helper function for downloading JSON
-function handleDownloadJson() {
-  if (!jsonData) return;
-  const blob = new Blob([JSON.stringify(jsonData, null, 2)], {
-    type: "application/json",
-  });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = "detections.json";
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-}
+  // Helper function for downloading JSON
+  function handleDownloadJson() {
+    if (!jsonData) return;
+    const blob = new Blob([JSON.stringify(jsonData, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "detections.json";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
 
   const showNotification = (message, type) => {
     setNotification({ message, type });
@@ -180,11 +327,17 @@ function handleDownloadJson() {
   return (
     <div style={styles.container}>
       {notification && (
-        <div style={{
-          ...styles.notification,
-          backgroundColor: notification.type === "success" ? "#2ed573" : 
-                         notification.type === "error" ? "#ff4757" : "#FFA502",
-        }}>
+        <div
+          style={{
+            ...styles.notification,
+            backgroundColor:
+              notification.type === "success"
+                ? "#2ed573"
+                : notification.type === "error"
+                ? "#ff4757"
+                : "#FFA502",
+          }}
+        >
           {notification.message}
         </div>
       )}
@@ -201,18 +354,14 @@ function handleDownloadJson() {
           id="fileInput"
           type="file"
           accept="image/*"
-          onChange={(e) => handleImageUpload(Array.from(e.target.files))}
+          onChange={(e) => handleImageUpload(Array.from(e.target.files || []))}
           disabled={isLoading}
           style={{ display: "none" }}
           multiple
         />
         {jsonData && (
           <>
-            <button
-              onClick={handleDownloadJson}
-              style={styles.downloadButton}
-              disabled={isLoading}
-            >
+            <button onClick={handleDownloadJson} style={styles.downloadButton} disabled={isLoading}>
               Download JSON
             </button>
             <button
@@ -228,44 +377,18 @@ function handleDownloadJson() {
 
       <div style={styles.displayArea}>
         {selectedImage && (
-          <div style={styles.imageContainer}>
+          <div style={{ position: "relative" }}>
             {(() => {
-              const imgObj = images.find(i => i.name === selectedImage);
+              const imgObj = images.find((i) => i.name === selectedImage);
               if (!imgObj) return null;
-              return (
-                <>
-                  <img
-                    src={imgObj.url}
-                    alt="Selected"
-                    style={styles.image}
-                    onLoad={(e) => {
-                      const { width, height } = e.target;
-                      setImageSize({ width, height });
-                    }}
-                  />
-                  {detections[selectedImage]?.map((detection, idx) => {
-                    const [x_min, y_min, x_max, y_max] = detection.bbox;
-                    const boxWidth = x_max - x_min;
-                    const boxHeight = y_max - y_min;
 
-                    return (
-                      <div
-                        key={idx}
-                        style={{
-                          ...styles.detectionBox,
-                          left: `${(x_min / imageSize.width) * 100}%`,
-                          top: `${(y_min / imageSize.height) * 100}%`,
-                          width: `${(boxWidth / imageSize.width) * 100}%`,
-                          height: `${(boxHeight / imageSize.height) * 100}%`,
-                        }}
-                      >
-                        <span style={styles.detectionLabel}>
-                          {detection.label} ({Math.round(detection.confidence * 100)}%)
-                        </span>
-                      </div>
-                    );
-                  })}
-                </>
+              return (
+                <ImageStage
+                  src={imgObj.url}
+                  detections={detections[selectedImage] || []}
+                  fitMode="contain" // switch to "cover" for full container coverage (cropping)
+                  stageHeight={500}
+                />
               );
             })()}
           </div>
@@ -287,14 +410,8 @@ function handleDownloadJson() {
             }}
             onClick={() => setSelectedImage(image.name)}
           >
-            <img
-              src={image.url}
-              alt={`Thumbnail ${index}`}
-              style={styles.thumbnailImage}
-            />
-            {detections[image.name]?.length === 0 && (
-              <div style={styles.noAnimalsLabel}>No Animals</div>
-            )}
+            <img src={image.url} alt={`Thumbnail ${index}`} style={styles.thumbnailImage} />
+            {detections[image.name]?.length === 0 && <div style={styles.noAnimalsLabel}>No Animals</div>}
           </div>
         ))}
       </div>
@@ -304,29 +421,10 @@ function handleDownloadJson() {
           <div style={styles.feedbackContent}>
             <h3 style={styles.feedbackTitle}>Provide Feedback on Predictions</h3>
             <p style={styles.feedbackSubtitle}>Please correct any mistakes in the detections:</p>
-            
+
             {detections[selectedImage]?.map((detection) => (
               <div key={detection.index} style={styles.feedbackItem}>
                 <h4 style={styles.detectionHeader}>Detection #{detection.index + 1}</h4>
-                <div style={styles.feedbackRow}>
-                  <label style={styles.feedbackLabel}>
-                    <input
-                      type="checkbox"
-                      checked={currentFeedback[detection.index]?.bbox_correct ?? true}
-                      onChange={(e) =>
-                        setCurrentFeedback((prev) => ({
-                          ...prev,
-                          [detection.index]: {
-                            ...prev[detection.index],
-                            bbox_correct: e.target.checked,
-                          },
-                        }))
-                      }
-                      style={styles.feedbackCheckbox}
-                    />
-                    Bounding box is correct
-                  </label>
-                </div>
                 <div style={styles.feedbackRow}>
                   <label style={styles.feedbackLabel}>
                     <input
@@ -372,10 +470,7 @@ function handleDownloadJson() {
             ))}
 
             <div style={styles.feedbackActions}>
-              <button
-                onClick={() => setFeedbackOpen(false)}
-                style={styles.cancelButton}
-              >
+              <button onClick={() => setFeedbackOpen(false)} style={styles.cancelButton}>
                 Cancel
               </button>
               <button
@@ -431,10 +526,6 @@ const styles = {
     border: "1px solid #dfe6e9",
     fontSize: "14px",
     transition: "border-color 0.3s ease",
-    ":focus": {
-      outline: "none",
-      borderColor: "#1e90ff",
-    },
   },
   authButton: {
     padding: "12px",
@@ -446,10 +537,6 @@ const styles = {
     fontWeight: "500",
     cursor: "pointer",
     transition: "all 0.3s ease",
-    ":hover": {
-      backgroundColor: "#187bcd",
-      transform: "translateY(-2px)",
-    },
   },
   toggleAuthButton: {
     marginTop: "15px",
@@ -460,9 +547,6 @@ const styles = {
     fontSize: "14px",
     textDecoration: "underline",
     transition: "color 0.2s ease",
-    ":hover": {
-      color: "#187bcd",
-    },
   },
   error: {
     color: "#ff4757",
@@ -513,10 +597,6 @@ const styles = {
     fontSize: "14px",
     fontWeight: "500",
     transition: "all 0.3s ease",
-    ":hover": {
-      backgroundColor: "#e84118",
-      transform: "translateY(-2px)",
-    },
   },
   buttonRow: {
     display: "flex",
@@ -534,10 +614,6 @@ const styles = {
     fontSize: "16px",
     fontWeight: "500",
     transition: "all 0.3s ease",
-    ":hover": {
-      backgroundColor: "#187bcd",
-      transform: "translateY(-2px)",
-    },
   },
   downloadButton: {
     padding: "12px 24px",
@@ -549,15 +625,6 @@ const styles = {
     border: "none",
     cursor: "pointer",
     transition: "all 0.3s ease",
-    ":hover": {
-      backgroundColor: "#25b864",
-      transform: "translateY(-2px)",
-    },
-    ":disabled": {
-      backgroundColor: "#cccccc",
-      cursor: "not-allowed",
-      transform: "none",
-    },
   },
   feedbackButton: {
     padding: "12px 24px",
@@ -569,54 +636,14 @@ const styles = {
     border: "none",
     cursor: "pointer",
     transition: "all 0.3s ease",
-    ":hover": {
-      backgroundColor: "#e69500",
-      transform: "translateY(-2px)",
-    },
-    ":disabled": {
-      backgroundColor: "#cccccc",
-      cursor: "not-allowed",
-      transform: "none",
-    },
   },
   displayArea: {
     minHeight: "500px",
     position: "relative",
     marginBottom: "20px",
-    backgroundColor: "#f5f6fa",
     borderRadius: "10px",
     padding: "20px",
     boxShadow: "0 4px 6px rgba(0,0,0,0.1)",
-  },
-  imageContainer: {
-    position: "relative",
-    display: "inline-block",
-    maxWidth: "100%",
-  },
-  image: {
-    maxWidth: "100%",
-    maxHeight: "500px",
-    borderRadius: "8px",
-    boxShadow: "0 4px 12px rgba(0, 0, 0, 0.15)",
-  },
-  detectionBox: {
-    position: "absolute",
-    border: "2px solid #00B894",
-    borderRadius: "4px",
-    background: "rgba(0, 184, 148, 0.15)",
-    boxSizing: "border-box",
-  },
-  detectionLabel: {
-    position: "absolute",
-    top: "-25px",
-    left: "0",
-    background: "#00B894",
-    color: "#fff",
-    padding: "4px 8px",
-    fontSize: "12px",
-    fontWeight: "bold",
-    borderRadius: "4px",
-    whiteSpace: "nowrap",
   },
   scrollContainer: {
     display: "flex",
@@ -631,10 +658,6 @@ const styles = {
     borderRadius: "6px",
     cursor: "pointer",
     transition: "all 0.3s ease",
-    ":hover": {
-      transform: "scale(1.05)",
-      boxShadow: "0 4px 8px rgba(0,0,0,0.2)",
-    },
   },
   thumbnailImage: {
     width: "120px",
@@ -731,10 +754,6 @@ const styles = {
     fontSize: "14px",
     marginLeft: "10px",
     transition: "border-color 0.3s ease",
-    ":focus": {
-      outline: "none",
-      borderColor: "#1e90ff",
-    },
   },
   feedbackActions: {
     display: "flex",
@@ -751,10 +770,6 @@ const styles = {
     cursor: "pointer",
     fontWeight: "500",
     transition: "all 0.2s ease",
-    ":hover": {
-      backgroundColor: "#25b864",
-      transform: "translateY(-2px)",
-    },
   },
   cancelButton: {
     padding: "10px 20px",
@@ -765,10 +780,6 @@ const styles = {
     cursor: "pointer",
     fontWeight: "500",
     transition: "all 0.2s ease",
-    ":hover": {
-      backgroundColor: "#e84118",
-      transform: "translateY(-2px)",
-    },
   },
   detectionHeader: {
     fontSize: "16px",

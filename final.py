@@ -99,7 +99,7 @@ def get_class_distribution(dataset):
         raise ValueError("Unsupported dataset type")
 
 def setup_model(num_classes, device, subset_group=1, backbone='resnet50'):
-    """Initialize backbone + 2-layer head; keeps your exact head."""
+    """Initialize backbone + 2-layer head"""
     if backbone == 'resnet50':
         base = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
         in_feats = base.fc.in_features
