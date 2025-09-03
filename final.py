@@ -36,7 +36,7 @@ def parse_args():
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay for optimizer')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate')
     parser.add_argument('--test-split', type=float, default=0.1, help='Fraction of data to use as test set')
-    parser.add_argument('--cv-folds', type=int, default=2, help='If >0, run classical stratified k-fold cross-validation with this many folds')
+    parser.add_argument('--cv-folds', type=int, default=5, help='If >0, run classical stratified k-fold cross-validation with this many folds')
     return parser.parse_args()
 
 def convert(obj):
@@ -987,7 +987,7 @@ def main():
         os.makedirs(run_dir, exist_ok=True)
 
         # Train on your progressive subsets (uses your existing logic)
-        history, trained_model = train_on_subsets(
+        history, trained_model = train_with_cross_validation(
             args=args,
             backbone_name=backbone,            # <-- requires tiny signature change in train_on_subsets
             full_dataset=trainval_dataset,
