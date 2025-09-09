@@ -24,12 +24,12 @@ def infer_class_names(history, test_results):
 
 def main():
     # Load JSONs from current directory
-    with open("training_history.json", "r") as f:
+    with open("training_history_final_resnet.json", "r") as f:
         history = json.load(f)
 
     test_results = None
-    if os.path.exists("test_results.json"):
-        with open("test_results.json", "r") as f:
+    if os.path.exists("test_results_final_resnet.json"):
+        with open("test_results_final_resnet.json", "r") as f:
             test_results = json.load(f)
 
     class_names = infer_class_names(history, test_results)

@@ -8,12 +8,7 @@
 *.csv
 *.json
 *.xml
-*.pt
-*.h5
-*.pth
+
 
 # Ignore the dataset folder if images are stored there
 KGA_S1/
-wildlife_classifier/classifier/models/15_s.pth
-wildlife_classifier\classifier\models\empty_image_detector.h5
-wildlife_classifier\classifier\models\15_s.pth

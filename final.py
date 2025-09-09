@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split, StratifiedShuffleSplit
 from sklearn.metrics import classification_report, confusion_matrix, top_k_accuracy_score, average_precision_score, roc_auc_score
 from tqdm import tqdm
 import argparse
@@ -25,18 +25,18 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True  # Handle corrupted images
 def parse_args():
     parser = argparse.ArgumentParser(description='Progressive ResNet50 Wildlife Classification')
     parser.add_argument('--data-dir', type=str, default='wcs_cropped_download', help='Path to dataset directory')
-    parser.add_argument('--epochs-per-subset', type=int, default=15, help='Epochs per subset')
+    parser.add_argument('--epochs-per-subset', type=int, default=40, help='Epochs per subset')
     parser.add_argument('--batch-size', type=int, default=8, help='Batch size for training')
     parser.add_argument('--lr', type=float, default=0.0001, help='Initial learning rate')
     parser.add_argument('--min-samples', type=int, default=5000, help='Minimum samples per class')
     parser.add_argument('--num-subsets', type=int, default=20, help='Number of data subsets (groups)')
     parser.add_argument('--num-workers', type=int, default=1, help='Number of data loader workers')
-    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints_cv_tos_384', help='Directory to save checkpoints')
-    parser.add_argument('--early-stopping', type=int, default=15, help='Patience for early stopping')
+    parser.add_argument('--checkpoint-dir', type=str, default='last_30', help='Directory to save checkpoints')
+    parser.add_argument('--early-stopping', type=int, default=35, help='Patience for early stopping')
     parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay for optimizer')
     parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate')
     parser.add_argument('--test-split', type=float, default=0.1, help='Fraction of data to use as test set')
-    parser.add_argument('--cv-folds', type=int, default=5, help='If >0, run classical stratified k-fold cross-validation with this many folds')
+    parser.add_argument('--cv-folds', type=int, default=1, help='If >0, run classical stratified k-fold cross-validation with this many folds')
     return parser.parse_args()
 
 def convert(obj):
@@ -98,50 +98,37 @@ def get_class_distribution(dataset):
     else:
         raise ValueError("Unsupported dataset type")
 
-def setup_model(num_classes, device, subset_group=1, backbone='resnet50'):
-    """Initialize backbone + 2-layer head"""
-    if backbone == 'resnet50':
-        base = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
-        in_feats = base.fc.in_features
-        base.fc = nn.Identity()
-    elif backbone == 'convnext_tiny':
-        base = models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1)
-        in_feats = base.classifier[2].in_features
-        base.classifier[2] = nn.Identity()
-    elif backbone == 'vit_b_16':
-        base = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
-        in_feats = base.heads.head.in_features
-        base.heads.head = nn.Identity()
-    elif backbone == 'mobilenet_v3_large':
-        base = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.IMAGENET1K_V2)
-        in_feats = base.classifier[3].in_features
-        base.classifier[3] = nn.Identity()
-    else:
-        raise ValueError(f"Unknown backbone '{backbone}'")
+# final.py
+from torchvision import models
+import torch.nn as nn
+import torch
 
-    classifier = nn.Sequential(
-        nn.Linear(in_feats, 1024),
+def setup_model(num_classes, device, subset_group=1, backbone='resnet50'):
+    """
+    Plain torchvision ResNet50 + 2-layer head (no custom wrapper).
+    Keeps signature compatible with the rest of your code.
+    The 'backbone' arg is accepted for compatibility but only 'resnet50' is supported here.
+    """
+    if backbone != 'resnet50':
+        print(f"[setup_model] Warning: forcing resnet50; received backbone='{backbone}'")
+
+    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+
+    # 2-layer MLP head
+    model.fc = nn.Sequential(
+        nn.Linear(model.fc.in_features, 1024),
         nn.BatchNorm1d(1024),
-        nn.ReLU(),
+        nn.ReLU(inplace=True),
         nn.Dropout(0.5),
         nn.Linear(1024, num_classes)
     )
 
-    class Net(nn.Module):
-        def __init__(self, feature, classifier):
-            super().__init__()
-            self.feature = feature
-            self.classifier = classifier
-        def forward(self, x):
-            x = self.feature(x)
-            # CNNs return (N,C,H,W); ViT returns (N,D)
-            if x.ndim == 4:
-                x = torch.flatten(nn.functional.adaptive_avg_pool2d(x, 1), 1)
-            return self.classifier(x)
+    for p in model.parameters():
+        p.requires_grad = True
 
-    model = Net(base, classifier).to(device)
+    model = model.to(device)
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"🔧 Model setup: Group {subset_group}, Backbone={backbone}, Trainable params: {trainable_params:,}")
+    print(f"🔧 Model setup: Group {subset_group}, Backbone=resnet50, Trainable params: {trainable_params:,}")
     return model
 
 def load_checkpoint(model, checkpoint_path, device):
@@ -514,10 +501,17 @@ def train_with_cross_validation(args, backbone_name, full_dataset, device, test_
     Stratified K-Fold cross-validation training.
     Fixed to ensure validation data is completely separate from training data.
     """
-    skf = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=42)
-    labels = [lbl for _, lbl in full_dataset.samples]
+    labels = [lbl for _, lbl in full_dataset.samples]  
     class_names = full_dataset.classes
 
+    if args.cv_folds == 1:
+        val_fraction = getattr(args, "val_fraction", 0.2)  # you can add to args
+        splitter = StratifiedShuffleSplit(n_splits=1, test_size=val_fraction, random_state=42)
+        splits = list(splitter.split(np.zeros(len(labels)), labels))
+        total_folds = 1
+    else:
+        skf = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=42)
+        
     history = []
     best_overall_acc = -1.0
     best_model_state = None
@@ -542,8 +536,8 @@ def train_with_cross_validation(args, backbone_name, full_dataset, device, test_
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(labels)), labels)):
-        print(f"\n🧩 Fold {fold+1}/{args.cv_folds}")
+    for fold, (train_idx, val_idx) in enumerate(splits):
+        print(f"\n🧩 Fold {fold+1}/{total_folds}")
         print(f"📊 Train size: {len(train_idx)} | Val size: {len(val_idx)}")
         
         # Create SEPARATE dataset copies for train and val
@@ -781,6 +775,108 @@ def save_plots(history, class_names, checkpoint_dir, test_results=None):
         plt.tight_layout()
         plt.savefig(os.path.join(confidence_plot_dir, 'confidence_gap.png'))
         plt.close()
+        
+        # 7. Confidence Gap – intuitive alternatives
+        gaps = np.array(test_results['predictions']['confidence_gaps'])
+        preds = np.array(test_results['predictions']['pred_labels'])
+        true = np.array(test_results['predictions']['true_labels'])
+        correct = (preds == true)
+
+        # ---------- 7a) Ambiguity rate per class (sorted bar chart) ----------
+        TAU = 0.10  # threshold for "ambiguous" prediction
+        ambig_rate, support, classes_avail = [], [], []
+        for i, cls in enumerate(class_names):
+            m = (preds == i)
+            if m.sum() == 0:
+                continue
+            ambig_rate.append(np.mean(gaps[m] < TAU))
+            support.append(int(m.sum()))
+            classes_avail.append(cls)
+
+        order = np.argsort(ambig_rate)[::-1]  # highest ambiguity first
+        rates_sorted = np.array(ambig_rate)[order]
+        supp_sorted = np.array(support)[order]
+        classes_sorted = np.array(classes_avail)[order]
+
+        plt.figure(figsize=(12, 6))
+        plt.bar(range(len(classes_sorted)), rates_sorted)
+        plt.xticks(range(len(classes_sorted)), classes_sorted, rotation=90)
+        plt.ylabel(f'Pct. with gap < {TAU:.2f}')
+        plt.title('Ambiguity Rate by Predicted Class (lower is better)')
+        # annotate supports lightly
+        for x, (r, s) in enumerate(zip(rates_sorted, supp_sorted)):
+            plt.text(x, r + 0.01, f'n={s}', ha='center', va='bottom', fontsize=8)
+        plt.ylim(0, 1)
+        plt.tight_layout()
+        plt.savefig(os.path.join(confidence_plot_dir, 'confidence_gap_ambiguity_rate_bar.png'), dpi=200)
+        plt.close()
+
+        # ---------- 7b) Risk map: median gap vs. error rate ----------
+        # per-class recall from the classification report
+        cr = test_results['classification_report']
+        y_err, x_medgap, sizes, labels = [], [], [], []
+        for i, cls in enumerate(class_names):
+            # skip if never predicted (scatter would be misleading)
+            m = (preds == i)
+            if m.sum() == 0 or cls not in cr:
+                continue
+            recall = cr[cls]['recall'] if 'recall' in cr[cls] else np.nan
+            y_err.append(1.0 - recall)
+            x_medgap.append(np.median(gaps[m]))
+            sizes.append(m.sum())
+            labels.append(cls)
+
+        plt.figure(figsize=(10, 7))
+        sizes_scaled = (np.array(sizes) / np.max(sizes)) * 900 + 50  # readable bubbles
+        sc = plt.scatter(x_medgap, y_err, s=sizes_scaled, alpha=0.7)
+        plt.xlabel('Median confidence gap (higher = safer)')
+        plt.ylabel('Error rate (1 - recall)')
+        plt.title('Per-class Risk Map')
+        plt.axvline(0.10, linestyle='--', linewidth=1)  # example gap threshold lines
+        plt.axvline(0.20, linestyle='--', linewidth=1)
+
+        # label top 5 by a simple risk score = error * ambiguity rate (<0.2)
+        risk_scores = []
+        for i, cls in enumerate(labels):
+            m = (preds == class_names.index(cls))
+            risk_scores.append(y_err[i] * np.mean(gaps[m] < 0.20))
+        for idx in np.argsort(risk_scores)[-5:]:
+            plt.text(x_medgap[idx], y_err[idx]+0.02, labels[idx], ha='center', fontsize=9)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(confidence_plot_dir, 'confidence_gap_risk_scatter.png'), dpi=200)
+        plt.close()
+
+        # ---------- 7c) Acceptance vs. Accuracy using gap threshold ----------
+        thresholds = np.linspace(0.0, 0.99, 40)
+        coverages, accuracies = [], []
+        for t in thresholds:
+            keep = gaps >= t
+            cov = keep.mean()
+            coverages.append(cov)
+            if keep.any():
+                accuracies.append(correct[keep].mean())
+            else:
+                accuracies.append(np.nan)
+
+        plt.figure(figsize=(12, 5))
+        # Left: accuracy vs threshold
+        plt.subplot(1, 2, 1)
+        plt.plot(thresholds, accuracies, 'o-')
+        plt.xlabel('Gap threshold (τ)')
+        plt.ylabel('Accuracy among accepted')
+        plt.title('Accuracy vs. Gap Threshold')
+
+        # Right: coverage vs threshold
+        plt.subplot(1, 2, 2)
+        plt.plot(thresholds, coverages, 'o-')
+        plt.xlabel('Gap threshold (τ)')
+        plt.ylabel('Coverage (fraction accepted)')
+        plt.title('Coverage vs. Gap Threshold')
+        plt.tight_layout()
+        plt.savefig(os.path.join(confidence_plot_dir, 'confidence_gap_acceptance_tradeoff.png'), dpi=200)
+        plt.close()
+
 
     # === Separate training plots ===
     df = pd.DataFrame(history)
